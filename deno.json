@@ -76,10 +76,7 @@
     "clean": {
       "command": "echo cleaning && rm -rf dist"
     },
-    "compile:photocast": "deno_compile.sh --flags='-RWESI' -r photocast.ts",
-
-
-
+    "compile:photocast": "deno_compile --flags='-A' photocast.ts",
 
     "install": {
       "description": "install built scripts to users bin dir",
