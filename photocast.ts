@@ -1,13 +1,11 @@
 #!/usr/bin/env deno run --allow-net --allow-read --allow-write --allow-sys --allow-run --allow-env
 /**
- * PHOTOCAST PRO - GOLD VERSION 71.00
- * ==================================
  * CORE FEATURES:
  * - RAW+JPG Deduplication: Prefers native JPGs to avoid redundant RAW conversions.
  * - Anti-Bounce Scrubber: Instant JUMP handling via WebSockets.
  * - Shared State: Pause, Settings (IP/Timeout), and Index synced across all clients.
  * - EXIF: Fractional shutter and clean aperture values.
- * - Stability: Suppresses Deno/Oak 'request closed' noise; preserves all debug telemetry.
+ * - Stability: Suppresses Deno/Oak network noise; preserves all debug telemetry.
  */
 
 import { Application, Router } from "https://deno.land/x/oak@v12.6.1/mod.ts";
@@ -22,9 +20,72 @@ import {
 } from "https://deno.land/std@0.208.0/path/mod.ts";
 import process from "node:process";
 
+// --- GLOBAL DENO NOISE FILTER ---
+const networkErrors = [
+  "request closed",
+  "Connection reset by peer",
+  "Cannot read headers",
+  "Broken pipe",
+  "connection closed before message completed"
+];
+
+function isNoisy(msg: string) {
+  return networkErrors.some(err => msg?.includes(err));
+}
+
+let silencingOak = false;
+const originalConsoleError = console.error;
+
+console.error = (...args: any[]) => {
+  const msgStr = typeof args[0] === "string" ? args[0] : "";
+  const isErrorObj = args[0] instanceof Error;
+  const directErrorMsg = isErrorObj ? args[0].message : "";
+  const errStr = args[1] instanceof Error ? args[1].message : "";
+
+  // 1. Did Oak just start printing a noisy error?
+  if (msgStr.includes("[uncaught application error]")) {
+    if (isNoisy(msgStr) || isNoisy(errStr)) {
+      silencingOak = true; // Turn on the silencer
+      return; 
+    }
+  }
+
+  // 2. Are we currently silencing Oak's multi-line output?
+  if (silencingOak) {
+    if (msgStr.includes("\nrequest:") || msgStr.includes("response:") || msgStr.includes("request:")) {
+      return; // Swallow the request/response payloads
+    }
+    if (isErrorObj) {
+      silencingOak = false; // The raw Error object is the final thing Oak prints. Turn silencer off.
+      return; 
+    }
+    // Fallback: If it's a random string that happens to match our noise filter
+    if (isNoisy(msgStr)) return;
+  }
+
+  // 3. Catch stray Deno native error objects passed directly to console.error
+  if (isErrorObj && isNoisy(directErrorMsg)) {
+      return; 
+  }
+  
+  // 4. Otherwise, print normally!
+  originalConsoleError(...args);
+};
+
+// Catch native Deno unhandled rejections
+globalThis.addEventListener("unhandledrejection", (e) => {
+  if (isNoisy(e.reason?.message || String(e.reason))) e.preventDefault();
+});
+
+// Catch native Deno uncaught errors
+globalThis.addEventListener("error", (e) => {
+  if (isNoisy(e.error?.message || e.message)) e.preventDefault();
+});
+// --------------------------------
+
 const { Client, DefaultMediaReceiver } = castv2;
 const USER = Deno.env.get("USER") || "default";
-const BASE_CACHE_DIR = `/tmp/photocast_${USER}`;
+const BASE_CACHE_DIR = `/tmp/${USER}/photocast`;
 const STATE_FILE = join(BASE_CACHE_DIR, "state.json");
 const SETTINGS_FILE = join(BASE_CACHE_DIR, "settings.json");
 const GEO_CACHE_FILE = join(BASE_CACHE_DIR, "geo_cache.json");
@@ -58,7 +119,6 @@ async function purgeCacheKeepSettings() {
       }
     }
   } catch (e: any) {
-    // swallow - caller may log
     console.log(`PurgeCacheKeepSettings error: ${e.message}`);
   }
 }
@@ -303,6 +363,7 @@ class ImageProcessor {
     this.readyMap.clear();
     return this.currentWorkerId;
   }
+  
   private async tryExtract(
     p: string,
     v: string,
@@ -314,24 +375,43 @@ class ImageProcessor {
       await new Deno.Command("exiftool", {
         args: ["-quiet", "-m", "-b", tag, "-W", v, p],
       }).output();
+      
       try {
-        if ((await Deno.stat(v)).size > 5000) {
-          await new Deno.Command("exiftool", {
-            args: [
-              "-quiet",
-              "-overwrite_original",
-              "-TagsFromFile",
-              p,
-              "-Orientation",
-              v,
-            ],
-          }).output();
-          return true;
+        const stat = await Deno.stat(v);
+        if (stat.isFile && stat.size > 5000) {
+          
+          // NEW: Verify it is actually a valid JPEG by checking the first 2 "magic" bytes
+          const f = await Deno.open(v, { read: true });
+          const header = new Uint8Array(2);
+          await f.read(header);
+          f.close();
+
+          if (header[0] === 0xFF && header[1] === 0xD8) {
+            // It's a real JPEG! Copy orientation and return success.
+            await new Deno.Command("exiftool", {
+              args: [
+                "-quiet",
+                "-overwrite_original",
+                "-TagsFromFile",
+                p,
+                "-Orientation",
+                v,
+              ],
+            }).output();
+            return true;
+          } else {
+            // It extracted garbage. Delete it and keep trying or fall back to libraw.
+            this.logger.debug(`[Processor] Extracted fake JPEG from ${tag}, falling back...`);
+            await Deno.remove(v);
+          }
         }
-      } catch (e: any) {}
+      } catch (e: any) {
+        // File didn't exist or couldn't be read, just proceed to the next tag
+      }
     }
     return false;
   }
+
   async process(
     photoPath: string,
     index: number,
@@ -368,8 +448,10 @@ class ImageProcessor {
         }
         if (gen !== this.currentWorkerId) return;
       }
-      this.logger.debug(`[Processor] Magick generating ${index}...`);
-      await new Deno.Command("magick", {
+      this.logger.debug(`[Processor] Magick generating ${index}... ${input}`);
+      
+      // --- MAGICK CONVERSION WITH ERROR HANDLING ---
+      const convertCmd = new Deno.Command("magick", {
         args: [
           input,
           "-auto-orient",
@@ -378,14 +460,22 @@ class ImageProcessor {
           "-strip",
           outPath,
         ],
-      }).output();
+      });
+      const convertOut = await convertCmd.output();
+      if (convertOut.code !== 0) {
+        const errStr = new TextDecoder().decode(convertOut.stderr).trim() || "Unknown Magick error";
+        throw new Error(`Magick Convert failed (Code ${convertOut.code}): ${errStr}`);
+      }
+      // -------------------------------------------
+
       if (scratchPath) {
         try {
           await Deno.remove(scratchPath);
         } catch (e: any) {}
       }
       if (gen !== this.currentWorkerId) return;
-      const bOut = await new Deno.Command("magick", {
+      
+      const bCmd = new Deno.Command("magick", {
         args: [
           outPath,
           "-gravity",
@@ -398,15 +488,22 @@ class ImageProcessor {
           "%[fx:mean]",
           "info:",
         ],
-      }).output();
+      });
+      const bOut = await bCmd.output();
+      if (bOut.code !== 0) {
+        throw new Error(`Magick brightness check failed`);
+      }
+
       cachedExif["pc_is_dark"] =
         (parseFloat(new TextDecoder().decode(bOut.stdout)) < 0.4).toString();
+      
       if (cachedExif["GPS Latitude"] && cachedExif["GPS Longitude"]) {
         cachedExif["pc_location"] = await geo.getCity(
           cachedExif["GPS Latitude"],
           cachedExif["GPS Longitude"],
         );
       }
+      
       if (this.burnHud) {
         let dateVal =
           (cachedExif["Date/Time Original"] || cachedExif["Create Date"] ||
@@ -431,7 +528,7 @@ class ImageProcessor {
         const boxColor = isDark ? "rgba(0,0,0,0.5)" : "rgba(255,255,255,0.5)";
         const textColor = isDark ? "white" : "black";
 
-        await new Deno.Command("magick", {
+        const burnCmd = new Deno.Command("magick", {
           args: [
             outPath,
             "-fill",
@@ -451,14 +548,20 @@ class ImageProcessor {
             tag,
             outPath,
           ],
-        }).output();
+        });
+        const burnOut = await burnCmd.output();
+        if (burnOut.code !== 0) {
+            throw new Error(`Magick burnHud failed`);
+        }
       }
+      
       if (gen === this.currentWorkerId) {
         this.readyMap.add(index);
         this.onReady(index);
       }
     } catch (e: any) {
-      this.logger.debug(`Processor error: ${e.message}`);
+      // Changed to logger.error so silent failures become visible!
+      this.logger.error(`[Processor] Failed item ${index}: ${e.message}`);
     }
   }
   async runWorker(photos: any[], tripName: string, geo: GeoProxy) {
@@ -670,9 +773,18 @@ class PhotoCastSystem {
   private setupRoutes() {
     const app = new Application();
     const router = new Router();
+    
     app.addEventListener("error", (evt) => {
-      if (evt.error?.message?.includes("request closed")) return;
-      this.logger.debug(`[Server Error] ${evt.error?.message}`);
+      const err = evt.error;
+      const msg = err?.message || String(err) || "";
+      
+      // Ignore normal connection resets caused by fast scrubbing on the frontend
+      if (isNoisy(msg)) {
+        evt.preventDefault(); 
+        return;
+      }
+      
+      this.logger.debug(`[Server Error] ${msg}`);
     });
 
     router.get("/ws", (ctx) => {
@@ -977,7 +1089,20 @@ class PhotoCastSystem {
             }
           });
         }
-        const exif: Record<string, string> = { ...rawExif };
+        
+        // --- RESTRICTED EXIF LOGIC ---
+        const exif: Record<string, string> = {};
+        const keepKeys = [
+          "Date/Time Original",
+          "Create Date",
+          "Modify Date",
+          "Focal Length In 35mm Format",
+          "Focal Length 35mm Equiv"
+        ];
+        keepKeys.forEach(k => {
+          if (rawExif[k]) exif[k] = rawExif[k];
+        });
+
         const apKey = Object.keys(rawExif).find((k) =>
           k.toLowerCase().includes("aperture") &&
           !k.toLowerCase().includes("max")
@@ -985,6 +1110,7 @@ class PhotoCastSystem {
         exif["pc_aperture"] = apKey
           ? parseFloat(rawExif[apKey]).toFixed(1)
           : (rawExif["FNumber"] || "");
+          
         const ssKey = Object.keys(rawExif).find((k) =>
           k.toLowerCase().includes("shutter") &&
           k.toLowerCase().includes("speed")
@@ -992,6 +1118,7 @@ class PhotoCastSystem {
         exif["pc_shutter"] = ssKey
           ? formatShutter(rawExif[ssKey])
           : (rawExif["ExposureTime"] || "");
+          
         exif["pc_iso"] = (rawExif["ISO"] || "").toString();
 
         // GPS coordinate negation fix

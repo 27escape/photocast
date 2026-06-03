@@ -92,8 +92,12 @@
         min-width: 35px;
       }
 
+      /* "OFF" now acts as our Offline/Disabled state */
+      .btn-cast:disabled,
       .btn-cast[data-status="OFF"] {
-        background: #d32f2f;
+        background: #555 !important;
+        color: #999 !important;
+        cursor: not-allowed !important;
       }
       .btn-cast[data-status="AVAILABLE"] {
         background: #fbc02d;
@@ -152,11 +156,13 @@
         overflow: hidden;
         z-index: 100;
       }
+      
       #img-wrapper {
         position: relative;
         display: flex;
         width: 100%;
-        height: calc(100vh - 200px); /* Adjusted to make room for buttons */
+        flex: 1 1 0px; 
+        min-height: 0;
         align-items: center;
         justify-content: center;
         overflow: hidden;
@@ -164,8 +170,8 @@
       }
       #hero-img {
         display: block;
-        width: 100%;
-        height: 100%;
+        max-width: 100%;
+        max-height: 100%;
         object-fit: contain;
       }
 
@@ -188,12 +194,13 @@
         display: flex;
       }
 
-      /* New Playback Controls Styling */
       #playback-controls {
         display: flex;
         justify-content: center;
+        align-items: center;
         gap: 20px;
-        margin-top: 15px;
+        margin: 10px 0;
+        flex: 0 0 auto; 
         z-index: 550;
       }
       .icon-btn {
@@ -217,32 +224,38 @@
       }
 
       #scrub-bar {
-        width: 90%;
-        max-width: 600px;
-        margin: 15px 0 20px 0;
+        width: 100%;
+        max-width: 1200px;
+        padding: 0 15px;
+        box-sizing: border-box;
+        margin: 5px 0 10px 0;
         display: flex;
         flex-direction: column;
         align-items: center;
         z-index: 550;
-        gap: 10px;
+        gap: 4px;
       }
       #scrub-count {
         font-weight: 900;
         font-size: 0.9rem;
         color: #4fc3f7;
       }
+      
       #scrubber {
         width: 100%;
         -webkit-appearance: none;
         background: #333;
-        height: 8px;
-        border-radius: 10px;
+        height: 1.5px;
+        border-radius: 1px;
         outline: none;
+        padding: 0;
+        border: none;
+        margin: 0;
       }
       #scrubber::-webkit-slider-thumb {
         -webkit-appearance: none;
-        width: 24px;
-        height: 24px;
+        width: 16px;
+        height: 16px;
         background: #4fc3f7;
         border-radius: 50%;
         border: 3px solid #000;
@@ -398,6 +411,7 @@
       let socket,
         tripList = [],
         isScrubbing = false,
+        scrubTimer = null, // Timer for debouncing the scrub bar
         state = {
           index: -1,
           total: 0,
@@ -430,10 +444,20 @@
         state.index = parseInt(val);
         document.getElementById("scrub-count").innerText =
           `${state.index + 1} / ${state.total}`;
-        updateUI();
+        
+        // DEBOUNCE: Clear the previous timer if they are still moving
+        clearTimeout(scrubTimer);
+        
+        // Start a new timer to update the image only after 150ms of no movement
+        scrubTimer = setTimeout(() => {
+          updateUI();
+        }, 150);
       }
+      
       function onScrubChange(val) {
         lastJumpTime = Date.now();
+        // Clear the timer so we don't accidentally double-load
+        clearTimeout(scrubTimer); 
         socket.send(JSON.stringify({ type: "JUMP", index: parseInt(val) }));
       }
 
@@ -468,7 +492,9 @@
         }
       }
 
+      let connectTimeout;
       function connect() {
+        clearTimeout(connectTimeout);
         socket = new WebSocket("ws://" + location.host + "/ws");
         socket.onmessage = (e) => {
           const m = JSON.parse(e.data);
@@ -510,9 +536,13 @@
               document.getElementById("set-ip").value = m.settings.ip;
               document.getElementById("set-timeout").value = m.settings.timeout;
             }
-            document
-              .getElementById("cast-btn")
-              .setAttribute("data-status", m.castStatus || "OFF");
+            
+            // Updated Cast Button status and disabled handling
+            const castStatus = m.castStatus || "OFF";
+            const castBtn = document.getElementById("cast-btn");
+            castBtn.setAttribute("data-status", castStatus);
+            castBtn.disabled = (castStatus === "OFF");
+
             state.total = m.total;
             state.isScanning = m.isScanning;
             state.trip = m.trip;
@@ -548,7 +578,9 @@
             managePreload();
           }
         };
-        socket.onclose = () => setTimeout(connect, 1000);
+        socket.onclose = () => {
+          connectTimeout = setTimeout(connect, 1000);
+        };
       }
 
       function move(s) {
@@ -603,7 +635,7 @@
             hud_line += exif.pc_location ? " | " + exif.pc_location : "";
             hud_line += ` | F${exif.pc_aperture || "--"} | SS ${exif.pc_shutter || "--"} | ISO ${exif.pc_iso || "--"}`;
             
-            // NEW: Add Zoom (FF)
+            // Add Zoom (FF)
             const focalLength = exif["Focal Length In 35mm Format"] || exif["Focal Length 35mm Equiv"];
             let zoom = "--";
             if (focalLength) {
@@ -618,18 +650,10 @@
             img.onload = () => {
               try {
                 const wrapper = document.getElementById("img-wrapper");
-                // position HUD at the left edge of the image
-                const imgLeft =
-                  img.getBoundingClientRect().left -
-                  wrapper.getBoundingClientRect().left;
-                hud.style.width =
-                  Math.min(img.clientWidth, wrapper.clientWidth) + "px";
-                hud.style.left = imgLeft + 8 + "px";
+                hud.style.width = img.clientWidth + "px";
+                hud.style.left = img.offsetLeft + "px";
+                hud.style.top = (img.offsetTop + img.clientHeight - hud.offsetHeight) + "px";
                 hud.style.transform = "none";
-                // position HUD at image bottom
-                const top =
-                  img.offsetTop + img.clientHeight - hud.offsetHeight - 4;
-                hud.style.top = top + "px";
                 hud.style.visibility = "visible";
               } catch (e) {
                 hud.style.visibility = "visible";
@@ -716,8 +740,8 @@
         setCastDebug("Sending cast toggle request...");
         fetch("/toggle-cast")
           .then(async (res) => {
-            btn.disabled = false;
             if (!res.ok) {
+              btn.disabled = false;
               const text = await res.text();
               setCastDebug(
                 `Toggle failed: ${res.status} ${res.statusText} ${text}`,
@@ -732,14 +756,17 @@
             }
             const data = await res.json().catch(() => null);
             if (!data || data.status !== "ok") {
+              btn.disabled = false;
               setCastDebug(`Toggle failed: invalid response`);
               console.error("[Cast] toggle invalid response", data);
               return;
             }
             setCastDebug( ``);
-            document
-              .getElementById("cast-btn")
-              .setAttribute("data-status", data.castStatus || "OFF");
+            
+            // Set attribute and disable based on OFF status
+            const newStatus = data.castStatus || "OFF";
+            btn.setAttribute("data-status", newStatus);
+            btn.disabled = (newStatus === "OFF");
           })
           .catch((err) => {
             btn.disabled = false;
@@ -855,7 +882,22 @@
             });
           }
         });
+        
       connect();
+
+      // Handle mobile browser backgrounding/foregrounding
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") {
+          // We just came back from the background. 
+          // The socket might be dead, so forcefully close it and instantly reconnect.
+          if (socket) {
+            // Nullify the onclose handler temporarily so it doesn't trigger the 1s delay
+            socket.onclose = null; 
+            socket.close();
+          }
+          connect(); // Reconnect immediately to fetch the latest state
+        }
+      });
 
       // recompute HUD position on window resize
       window.addEventListener(
@@ -867,14 +909,9 @@
           if (!img.complete) return;
           try {
             const wrapper = document.getElementById("img-wrapper");
-            const imgLeft =
-              img.getBoundingClientRect().left -
-              wrapper.getBoundingClientRect().left;
-            hud.style.width =
-              Math.min(img.clientWidth, wrapper.clientWidth) + "px";
-            hud.style.left = imgLeft + 8 + "px";
-            hud.style.top =
-              img.offsetTop + img.clientHeight - hud.offsetHeight - 4 + "px";
+            hud.style.width = img.clientWidth + "px";
+            hud.style.left = img.offsetLeft + "px";
+            hud.style.top = (img.offsetTop + img.clientHeight - hud.offsetHeight) + "px";
           } catch (e) {}
         },
         { passive: true },
