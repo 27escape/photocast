@@ -81,7 +81,7 @@
     "install": {
       "description": "install built scripts to users bin dir",
       "command": "/bin/cp -av dist/* $HOME/bin",
-      "dependencies": ["test", "compile:all"]
+      "dependencies": ["test", "compile:photocast"]
     },
     "install:clean": {
       "description": "install cleanly built scripts to users bin dir",
