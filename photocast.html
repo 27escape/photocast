@@ -6,7 +6,7 @@
       name="viewport"
       content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
     />
-    <title>PhotoCast Pro v71</title>
+    <title>PhotoCast</title>
     <style>
       html,
       body {
@@ -16,14 +16,15 @@
         height: 100%;
         background: #000;
         overflow: hidden;
-      }
-      body {
         display: flex;
         flex-direction: column;
         color: white;
         font-family: sans-serif;
         padding-top: env(safe-area-inset-top);
+        /* Ensure the body respects the bottom safe area */
+        padding-bottom: env(safe-area-inset-bottom, 0px);
       }
+
 
       #ui-header {
         flex: 0 0 auto;
@@ -92,19 +93,26 @@
         min-width: 35px;
       }
 
-      /* "OFF" now acts as our Offline/Disabled state */
-      .btn-cast:disabled,
-      .btn-cast[data-status="OFF"] {
+      /* Cast Button States */
+      .btn-cast[data-status="OFF"],
+      .btn-cast[data-status="OFF"]:disabled {
         background: #555 !important;
         color: #999 !important;
         cursor: not-allowed !important;
       }
       .btn-cast[data-status="AVAILABLE"] {
-        background: #fbc02d;
-        color: black;
+        background: #e53935 !important; /* Red */
+        color: white !important;
+      }
+      .btn-cast[data-status="CONNECTING"],
+      .btn-cast[data-status="CONNECTING"]:disabled {
+        background: #ff9800 !important; /* Orange */
+        color: white !important;
+        cursor: wait !important;
       }
       .btn-cast[data-status="ACTIVE"] {
-        background: #388e3c;
+        background: #388e3c !important; /* Green */
+        color: white !important;
       }
 
       /* Settings Button Icon Styling */
@@ -170,8 +178,8 @@
       }
       #hero-img {
         display: block;
-        max-width: 100%;
-        max-height: 100%;
+        width: 100%;
+        height: 100%;
         object-fit: contain;
       }
 
@@ -198,10 +206,12 @@
         display: flex;
         justify-content: center;
         align-items: center;
-        gap: 20px;
+        gap: 10px;
         margin: 10px 0;
         flex: 0 0 auto; 
         z-index: 550;
+        /* Add a little bit of breathing room for mobile devices */
+        margin-bottom: 20px;
       }
       .icon-btn {
         background: #1a1a1a;
@@ -222,6 +232,13 @@
         width: 24px;
         height: 24px;
       }
+      /* Pause Button State Inversion */
+      .icon-btn.paused {
+        background: #fbc02d !important;
+      }
+      .icon-btn.paused svg {
+        fill: #000 !important;
+      }
 
       #scrub-bar {
         width: 100%;
@@ -234,6 +251,8 @@
         align-items: center;
         z-index: 550;
         gap: 4px;
+        /* Add this line to push the scrub bar up away from Android/iOS nav bars */
+        margin-bottom: calc(10px + env(safe-area-inset-bottom, 20px));
       }
       #scrub-count {
         font-weight: 900;
@@ -379,6 +398,8 @@
       </div>
       
       <div id="playback-controls">
+        <button class="icon-btn" onclick="move(-50)" type="button" style="font-size:0.7rem">-50</button>
+        <button class="icon-btn" onclick="move(-10)" type="button" style="font-size:0.7rem">-10</button>
         <button class="icon-btn" onclick="move(-1)" type="button">
           <svg viewBox="0 0 24 24"><path d="M15.41 16.59L10.83 12l4.58-4.59L14 6l-6 6 6 6z"/></svg>
         </button>
@@ -388,6 +409,8 @@
         <button class="icon-btn" onclick="move(1)" type="button">
           <svg viewBox="0 0 24 24"><path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6z"/></svg>
         </button>
+        <button class="icon-btn" onclick="move(10)" type="button" style="font-size:0.7rem">+10</button>
+        <button class="icon-btn" onclick="move(50)" type="button" style="font-size:0.7rem">+50</button>
       </div>
 
       <div id="scrub-bar">
@@ -411,7 +434,7 @@
       let socket,
         tripList = [],
         isScrubbing = false,
-        scrubTimer = null, // Timer for debouncing the scrub bar
+        scrubTimer = null,
         state = {
           index: -1,
           total: 0,
@@ -445,10 +468,7 @@
         document.getElementById("scrub-count").innerText =
           `${state.index + 1} / ${state.total}`;
         
-        // DEBOUNCE: Clear the previous timer if they are still moving
         clearTimeout(scrubTimer);
-        
-        // Start a new timer to update the image only after 150ms of no movement
         scrubTimer = setTimeout(() => {
           updateUI();
         }, 150);
@@ -456,7 +476,6 @@
       
       function onScrubChange(val) {
         lastJumpTime = Date.now();
-        // Clear the timer so we don't accidentally double-load
         clearTimeout(scrubTimer); 
         socket.send(JSON.stringify({ type: "JUMP", index: parseInt(val) }));
       }
@@ -510,6 +529,7 @@
             state.exifs = {};
             state.ready.clear();
             preloadCache.clear();
+            document.getElementById("hud-left").innerText = "";
             updateUI();
             return;
           }
@@ -526,10 +546,13 @@
             
             state.isPaused = m.isPaused;
             const pauseSvg = document.getElementById("pause-icon");
+            const pauseBtn = document.getElementById("pause-btn");
             if (state.isPaused) {
               pauseSvg.innerHTML = '<path d="M8 5v14l11-7z" />'; // Play triangle
+              pauseBtn.classList.add("paused");
             } else {
               pauseSvg.innerHTML = '<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" />'; // Pause bars
+              pauseBtn.classList.remove("paused");
             }
 
             if (!editingSettings) {
@@ -537,11 +560,13 @@
               document.getElementById("set-timeout").value = m.settings.timeout;
             }
             
-            // Updated Cast Button status and disabled handling
-            const castStatus = m.castStatus || "OFF";
+            // Only update the button if we aren't currently waiting for a connection request to resolve
             const castBtn = document.getElementById("cast-btn");
-            castBtn.setAttribute("data-status", castStatus);
-            castBtn.disabled = (castStatus === "OFF");
+            if (castBtn.getAttribute("data-status") !== "CONNECTING") {
+              const castStatus = m.castStatus || "OFF";
+              castBtn.setAttribute("data-status", castStatus);
+              castBtn.disabled = (castStatus === "OFF");
+            }
 
             state.total = m.total;
             state.isScanning = m.isScanning;
@@ -623,7 +648,6 @@
             document.getElementById("hud-left").innerText = "";
             let hud_line = "";
             
-            // Extract and format the Date and Time
             if (exif["Date/Time Original"]) {
               const dtParts = exif["Date/Time Original"].split(" ");
               const datePart = dtParts[0] ? dtParts[0].replace(/:/g, "-") : "";
@@ -631,11 +655,9 @@
               hud_line = timePart ? `${datePart} ${timePart}` : datePart;
             }
 
-            // Append Location and Technical Stats
             hud_line += exif.pc_location ? " | " + exif.pc_location : "";
             hud_line += ` | F${exif.pc_aperture || "--"} | SS ${exif.pc_shutter || "--"} | ISO ${exif.pc_iso || "--"}`;
             
-            // Add Zoom (FF)
             const focalLength = exif["Focal Length In 35mm Format"] || exif["Focal Length 35mm Equiv"];
             let zoom = "--";
             if (focalLength) {
@@ -646,7 +668,6 @@
             
             document.getElementById("hud-left").innerText = hud_line;
             
-            // show HUD once image has rendered and then size it to the image width
             img.onload = () => {
               try {
                 const wrapper = document.getElementById("img-wrapper");
@@ -659,7 +680,6 @@
                 hud.style.visibility = "visible";
               }
             };
-            // ensure HUD adjusts on resize
             window.requestAnimationFrame(() => {
               setTimeout(() => {
                 if (!img.complete) return;
@@ -699,18 +719,11 @@
               setCastDebug(
                 `Save failed: ${res.status} ${res.statusText} ${txt}`,
               );
-              console.error(
-                "[Settings] save error",
-                res.status,
-                res.statusText,
-                txt,
-              );
               return;
             }
             const data = await res.json().catch(() => null);
             if (!data || data.status !== "ok") {
               setCastDebug("Save failed: invalid response");
-              console.error("[Settings] save invalid response", data);
               return;
             }
             setCastDebug("Settings saved");
@@ -725,7 +738,6 @@
           })
           .catch((err) => {
             setCastDebug(`Save request error: ${err.message}`);
-            console.error("[Settings] save fetch error", err);
           });
       }
 
@@ -736,42 +748,39 @@
 
       function toggleCast() {
         const btn = document.getElementById("cast-btn");
+        
+        // Immediately lock the button and turn it Orange to indicate processing
         btn.disabled = true;
+        btn.setAttribute("data-status", "CONNECTING");
         setCastDebug("Sending cast toggle request...");
+
         fetch("/toggle-cast")
           .then(async (res) => {
             if (!res.ok) {
+              btn.setAttribute("data-status", "AVAILABLE"); // Fallback
               btn.disabled = false;
               const text = await res.text();
-              setCastDebug(
-                `Toggle failed: ${res.status} ${res.statusText} ${text}`,
-              );
-              console.error(
-                "[Cast] toggle response error",
-                res.status,
-                res.statusText,
-                text,
-              );
+              setCastDebug(`Toggle failed: ${res.status} ${res.statusText} ${text}`);
               return;
             }
             const data = await res.json().catch(() => null);
             if (!data || data.status !== "ok") {
+              btn.setAttribute("data-status", "AVAILABLE"); // Fallback
               btn.disabled = false;
               setCastDebug(`Toggle failed: invalid response`);
-              console.error("[Cast] toggle invalid response", data);
               return;
             }
-            setCastDebug( ``);
+            setCastDebug(``);
             
-            // Set attribute and disable based on OFF status
+            // Server responds with final status, assign it and unlock if appropriate
             const newStatus = data.castStatus || "OFF";
             btn.setAttribute("data-status", newStatus);
             btn.disabled = (newStatus === "OFF");
           })
           .catch((err) => {
+            btn.setAttribute("data-status", "AVAILABLE"); // Fallback
             btn.disabled = false;
             setCastDebug(`Toggle request error: ${err.message}`);
-            console.error("[Cast] toggle fetch error", err);
           });
       }
 
@@ -792,7 +801,7 @@
           touchStartY = 0,
           touchStartTime = 0,
           touchMoved = false;
-        const THRESHOLD = 50; // px
+        const THRESHOLD = 50; 
         wrapper.addEventListener(
           "touchstart",
           (ev) => {
@@ -822,12 +831,8 @@
             const dx = t.clientX - touchStartX;
             const dy = t.clientY - touchStartY;
             if (Math.abs(dx) > THRESHOLD && Math.abs(dx) > Math.abs(dy)) {
-              // swipe left -> next (move 1), swipe right -> prev (move -1)
               if (dx < 0) move(1);
               else move(-1);
-            } else if (!touchMoved) {
-              // tap: toggle pause
-              togglePause();
             }
           },
           { passive: true },
@@ -848,7 +853,6 @@
             dl.appendChild(o);
           });
           if (isMobile) {
-            // create native select fallback for mobile devices
             const sel = document.createElement("select");
             sel.id = "trips-select";
             sel.style.display = "none";
@@ -888,14 +892,11 @@
       // Handle mobile browser backgrounding/foregrounding
       document.addEventListener("visibilitychange", () => {
         if (document.visibilityState === "visible") {
-          // We just came back from the background. 
-          // The socket might be dead, so forcefully close it and instantly reconnect.
           if (socket) {
-            // Nullify the onclose handler temporarily so it doesn't trigger the 1s delay
             socket.onclose = null; 
             socket.close();
           }
-          connect(); // Reconnect immediately to fetch the latest state
+          connect(); 
         }
       });
 
