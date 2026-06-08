@@ -3,11 +3,11 @@
  * PHOTOCAST - send local photo albums to a chromecast
  */
 
-import { Application, Router } from 'https://deno.land/x/oak@v12.6.1/mod.ts';
+import { Application, Context, Router, RouterContext } from 'https://deno.land/x/oak@v12.6.1/mod.ts';
 import castv2 from 'castv2-client';
 import { Command } from 'commander';
 import { parse as parseYaml } from 'https://deno.land/std@0.208.0/yaml/mod.ts';
-import { basename, extname, join, parse as parsePath } from 'https://deno.land/std@0.208.0/path/mod.ts';
+import { basename, dirname, extname, isAbsolute, join, parse as parsePath } from 'https://deno.land/std@0.208.0/path/mod.ts';
 import process from 'node:process';
 
 const VERSION = '1.0.0';
@@ -613,15 +613,36 @@ class PhotoCastSystem {
     private timeRemaining = 30;
     private lastCastTime = 0;
 
+    private websiteDirPath: string;
+    private websiteIndexFile: string;
+
     constructor(
         private configPath: string,
         private port: number,
         private verbose: boolean,
         private headless: boolean,
-        private htmlFile: string,
+        private websitePath: string,
     ) {
         this.logger = new Logger(verbose, headless);
         this.geo = new GeoProxy();
+        const resolvedPath = isAbsolute(websitePath) ? websitePath : join(Deno.cwd(), websitePath);
+        try {
+            const info = Deno.statSync(resolvedPath);
+            console.log(`Resolved website path: ${resolvedPath} (${info.isDirectory ? 'directory' : 'file'})`);
+            if (info.isDirectory) {
+                this.websiteDirPath = resolvedPath;
+                this.websiteIndexFile = this.findWebsiteIndex(resolvedPath);
+            } else if (info.isFile) {
+                this.websiteDirPath = dirname(resolvedPath);
+                this.websiteIndexFile = resolvedPath;
+            } else {
+                throw new Error('Website path must be a directory or an HTML file.');
+            }
+        } catch (e) {
+            console.error(`Website file error: ${getErrorMessage(e)}`);
+            Deno.exit(1);
+        }
+
         try {
             this.settings = JSON.parse(Deno.readTextFileSync(SETTINGS_FILE));
         } catch {
@@ -674,8 +695,8 @@ class PhotoCastSystem {
 
     private watchHtmlFile() {
         try {
-            const watcher = Deno.watchFs(this.htmlFile);
-            this.logger.info(`[Watcher] Watching HTML file: ${this.htmlFile}`);
+            const watcher = Deno.watchFs(this.websiteIndexFile);
+            this.logger.info(`[Watcher] Watching HTML file: ${this.websiteIndexFile}`);
 
             let debounceTimer: number | null = null;
             (async () => {
@@ -692,6 +713,27 @@ class PhotoCastSystem {
         } catch (e) {
             this.logger.error(`[Watcher] Could not watch HTML: ${getErrorMessage(e)}`);
         }
+    }
+
+    private findWebsiteIndex(dir: string): string {
+        const candidates = ['index.html', 'photocast.html'];
+        for (const name of candidates) {
+            try {
+                const candidatePath = join(dir, name);
+                const stat = Deno.statSync(candidatePath);
+                if (stat.isFile) return candidatePath;
+            } catch {
+                // ignore missing candidate
+            }
+        }
+
+        for (const entry of Deno.readDirSync(dir)) {
+            if (entry.isFile && entry.name.toLowerCase().endsWith('.html')) {
+                return join(dir, entry.name);
+            }
+        }
+
+        throw new Error(`No HTML entry file found in website directory: ${dir}`);
     }
 
     private async saveState() {
@@ -909,8 +951,36 @@ class PhotoCastSystem {
             }
         });
 
+        const serveStaticFile = async (ctx: Context, filePath: string, contentType: string) => {
+            try {
+                ctx.response.body = await Deno.readFile(filePath);
+                ctx.response.type = contentType;
+            } catch {
+                ctx.response.status = 404;
+            }
+        };
+
+        router.get('/manifest.webmanifest', async (ctx) => {
+            await serveStaticFile(ctx, join(this.websiteDirPath, 'manifest.webmanifest'), 'application/manifest+json');
+        });
+
+        router.get('/sw.js', async (ctx) => {
+            await serveStaticFile(ctx, join(this.websiteDirPath, 'sw.js'), 'application/javascript');
+        });
+
+        router.get('/icons/:filename', async (ctx) => {
+            const filename = ctx.params.filename;
+            await serveStaticFile(ctx, join(this.websiteDirPath, 'icons', filename), 'image/png');
+        });
+
+        const htmlFilename = basename(this.websiteIndexFile);
+        router.get(`/${htmlFilename}`, async (ctx) => {
+            ctx.response.body = await Deno.readTextFile(this.websiteIndexFile);
+            ctx.response.type = 'text/html';
+        });
+
         router.get('/', async (ctx) => {
-            ctx.response.body = await Deno.readTextFile(this.htmlFile);
+            ctx.response.body = await Deno.readTextFile(this.websiteIndexFile);
             ctx.response.type = 'text/html';
         });
 
@@ -1135,7 +1205,7 @@ p.description('photocast - Cast albums to Chromecast')
     .option('-s, --search <string>', 'Search')
     .option('--headless', 'Headless background mode', false)
     .option('-c, --clear-cache', 'Wipe Cache', false)
-    .option('--html <string>', 'HTML', './photocast.html');
+    .option('--website <string>', 'Website folder or HTML entry file', './website');
 
 p.parse(process.argv);
 const o = p.opts();
@@ -1172,15 +1242,15 @@ if (o.clearCache) {
         console.warn('Could not clear cache.');
     }
 }
-if (o.html) {
+if (o.website) {
     try {
-        await Deno.readTextFile(o.html);
+        await Deno.stat(isAbsolute(o.website) ? o.website : join(Deno.cwd(), o.website));
     } catch (e) {
-        console.error(`HTML file error: ${getErrorMessage(e)}`);
+        console.error(`Website path error: ${getErrorMessage(e)}`);
         Deno.exit(1);
     }
 }
 
 const isRunningAsDaemon = !!Deno.env.get('PHOTOCAST_BACKGROUND');
 
-new PhotoCastSystem(o.yaml, parseInt(o.port), o.verbose, isRunningAsDaemon, o.html).start(o.search);
+new PhotoCastSystem(o.yaml, parseInt(o.port), o.verbose, isRunningAsDaemon, o.website).start(o.search);
