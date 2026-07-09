@@ -9,69 +9,30 @@ import { Command } from 'commander';
 import { parse as parseYaml } from 'https://deno.land/std@0.208.0/yaml/mod.ts';
 import { basename, dirname, extname, isAbsolute, join, parse as parsePath } from 'https://deno.land/std@0.208.0/path/mod.ts';
 import process from 'node:process';
+import { logger, setLogFile, getLogFile, setLogLevel } from '../various_tools/lib/logger.ts';
 
-const VERSION = '1.0.0';
+
+const PROGRAM = 'photocast';
+const VERSION = '1.1.0';
 const DEFAULT_PORT = 7080 ;
 const GOOGLE_CAST_PORT = 8009;
 
-// --- GLOBAL DENO NOISE FILTER ---
-const networkErrors = [
-    'request closed',
-    'Connection reset by peer',
-    'Cannot read headers',
-    'Broken pipe',
-    'connection closed before message completed',
-];
-
-function isNoisy(msg: string) {
-    return networkErrors.some((err) => msg?.includes(err));
-}
-
-function getErrorMessage(error: unknown): string {
-    return error instanceof Error ? error.message : String(error);
-}
-
-let silencingOak = false;
-const originalConsoleError = console.error;
-console.error = (...args: Parameters<typeof console.error>) => {
-    const msgStr = typeof args[0] === 'string' ? args[0] : '';
-    const isErrorObj = args[0] instanceof Error;
-    const directErrorMsg = isErrorObj ? args[0].message : '';
-    const errStr = args[1] instanceof Error ? args[1].message : '';
-
-    if (msgStr.includes('[uncaught application error]')) {
-        if (isNoisy(msgStr) || isNoisy(errStr)) {
-            silencingOak = true;
-            return;
-        }
-    }
-    if (silencingOak) {
-        if (msgStr.includes('\nrequest:') || msgStr.includes('response:') || msgStr.includes('request:')) return;
-        if (isErrorObj) {
-            silencingOak = false;
-            return;
-        }
-        if (isNoisy(msgStr)) return;
-    }
-    if (isErrorObj && isNoisy(directErrorMsg)) return;
-    originalConsoleError(...args);
-};
-
-globalThis.addEventListener('unhandledrejection', (e) => {
-    if (isNoisy(e.reason?.message || String(e.reason))) e.preventDefault();
-});
-globalThis.addEventListener('error', (e) => {
-    if (isNoisy(e.error?.message || e.message)) e.preventDefault();
-});
-// --------------------------------
+// Determine dynamic logfile path based on program name and system user
+const USER = Deno.env.get('USER') || Deno.env.get('USERNAME') || 'unknown_user';
+const LOG_FILE = `/tmp/${USER}/${PROGRAM}`;
 
 const { Client, DefaultMediaReceiver } = castv2;
-const USER = Deno.env.get('USER') || 'default';
-const BASE_CACHE_DIR = `/tmp/${USER}/photocast`;
-const STATE_FILE = join(BASE_CACHE_DIR, 'state.json');
-const SETTINGS_FILE = join(BASE_CACHE_DIR, 'settings.json');
-const GEO_CACHE_FILE = join(BASE_CACHE_DIR, 'geo_cache.json');
+const CACHE_DIR = `/tmp/${USER}/photocast`;
+const STATE_FILE = join(CACHE_DIR, 'state.json');
+const SETTINGS_FILE = join(CACHE_DIR, 'settings.json');
+const GEO_CACHE_FILE = join(CACHE_DIR, 'geo_cache.json');
 const FONT_PATH = '/System/Library/Fonts/Supplemental/Arial.ttf';
+const DEFAULT_SETTINGS: Settings = { ip: '192.168.0.216', timeout: 30, port: DEFAULT_PORT };
+const LOCAL_IP = Deno.networkInterfaces().find((i) => i.family === 'IPv4' && !i.address.startsWith('127.'))?.address ||
+    'localhost';
+
+// --------------------------------------------------------------------------
+// type defs
 
 type Settings = {
     ip: string;
@@ -150,9 +111,60 @@ type CastClient = {
     close: () => void;
 };
 
-const DEFAULT_SETTINGS: Settings = { ip: '192.168.0.216', timeout: 30, port: DEFAULT_PORT };
-const LOCAL_IP = Deno.networkInterfaces().find((i) => i.family === 'IPv4' && !i.address.startsWith('127.'))?.address ||
-    'localhost';
+// --------------------------------------------------------------------------
+// deno oak causes lots of issues, lets catch and work around them
+// GLOBAL DENO NOISE FILTER
+const networkErrors = [
+    'request closed',
+    'Connection reset by peer',
+    'Cannot read headers',
+    'Broken pipe',
+    'connection closed before message completed',
+];
+
+function isNoisy(msg: string) {
+    return networkErrors.some((err) => msg?.includes(err));
+}
+
+function getErrorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
+let silencingOak = false;
+const originalConsoleError = console.error;
+console.error = (...args: Parameters<typeof console.error>) => {
+    const msgStr = typeof args[0] === 'string' ? args[0] : '';
+    const isErrorObj = args[0] instanceof Error;
+    const directErrorMsg = isErrorObj ? args[0].message : '';
+    const errStr = args[1] instanceof Error ? args[1].message : '';
+
+    if (msgStr.includes('[uncaught application error]')) {
+        if (isNoisy(msgStr) || isNoisy(errStr)) {
+            silencingOak = true;
+            return;
+        }
+    }
+    if (silencingOak) {
+        if (msgStr.includes('\nrequest:') || msgStr.includes('response:') || msgStr.includes('request:')) return;
+        if (isErrorObj) {
+            silencingOak = false;
+            return;
+        }
+        if (isNoisy(msgStr)) return;
+    }
+    if (isErrorObj && isNoisy(directErrorMsg)) return;
+    originalConsoleError(...args);
+};
+
+globalThis.addEventListener('unhandledrejection', (e) => {
+    if (isNoisy(e.reason?.message || String(e.reason))) e.preventDefault();
+});
+globalThis.addEventListener('error', (e) => {
+    if (isNoisy(e.error?.message || e.message)) e.preventDefault();
+});
+
+// --------------------------------------------------------------------------
+// helpers
 
 async function purgeCacheKeepSettings() {
     try {
@@ -160,17 +172,17 @@ async function purgeCacheKeepSettings() {
         try {
             settingsText = Deno.readTextFileSync(SETTINGS_FILE);
         } catch {
-            console.warn('No existing settings found to preserve.');
+            logger.warn('No existing settings found to preserve.');
         }
-        await Deno.remove(BASE_CACHE_DIR, { recursive: true }).catch(() => {
-            console.warn('Cache directory does not exist or could not be removed. Continuing with purge.');
+        await Deno.remove(CACHE_DIR, { recursive: true }).catch(() => {
+            logger.warn('Cache directory does not exist or could not be removed. Continuing with purge.');
         });
-        await Deno.mkdir(BASE_CACHE_DIR, { recursive: true }).catch(() => {
-            console.warn('Could not recreate cache directory after purge. Some features may not work correctly.');
+        await Deno.mkdir(CACHE_DIR, { recursive: true }).catch(() => {
+            logger.warn('Could not recreate cache directory after purge. Some features may not work correctly.');
         });
         if (settingsText) await Deno.writeTextFile(SETTINGS_FILE, settingsText);
     } catch (e) {
-        console.log(`Purge error: ${getErrorMessage(e)}`);
+        logger.info(`Purge error: ${getErrorMessage(e)}`);
     }
 }
 
@@ -181,56 +193,7 @@ function formatShutter(ss: string): string {
     return '1/' + Math.round(1 / val);
 }
 
-class Logger {
-    private logFile: string;
-    constructor(private verbose: boolean, private headless: boolean) {
-        this.logFile = join(BASE_CACHE_DIR, 'photocast.log');
-        if (headless) {
-            try {
-                Deno.mkdirSync(BASE_CACHE_DIR, { recursive: true });
-            } catch {
-                console.warn('Could not create cache directory for logging. Logs will not be saved persistently.');
-            }
-        }
-    }
-
-    private ts() {
-        return new Date().toISOString();
-    }
-
-    private write(level: string, msg: string, color: string) {
-        const line = `[${this.ts()}] [${level}] ${msg}`;
-        if (this.headless) {
-            try {
-                Deno.writeTextFileSync(this.logFile, line + '\n', { append: true });
-            } catch {
-                console.warn('Could not write to log file.');
-            }
-        } else {
-            if (level === 'Error') {
-                console.error(`%c${line}`, `color: ${color}; font-weight: bold;`);
-            } else {
-                console.log(`%c${line}`, `color: ${color}; font-weight: bold;`);
-            }
-        }
-    }
-
-    info(msg: string) {
-        this.write('Info', msg, 'dodgerblue');
-    }
-    success(msg: string) {
-        this.write('OK', msg, 'limegreen');
-    }
-    warn(msg: string) {
-        this.write('Warn', msg, 'gold');
-    }
-    error(msg: string) {
-        this.write('Error', msg, 'crimson');
-    }
-    debug(msg: string) {
-        if (this.verbose) this.write('Debug', msg, 'gray');
-    }
-}
+// --------------------------------------------------------------------------
 
 class CastManager {
     private client: CastClient | null = null;
@@ -246,7 +209,7 @@ class CastManager {
     }
 
     updateIp(newIp: string) {
-        this.logger.info(`[Cast] IP updated to ${newIp}`);
+        logger.info(`[Cast] IP updated to ${newIp}`);
         this.ip = newIp;
         this.dispose();
         this.startHeartbeat();
@@ -259,7 +222,7 @@ class CastManager {
             const up = await this.probe();
             const newStatus = up ? 'AVAILABLE' : 'OFF';
             if (this.status !== newStatus) {
-                this.logger.info(`[Cast] Heartbeat status change: ${this.status} -> ${newStatus}`);
+                logger.info(`[Cast] Heartbeat status change: ${this.status} -> ${newStatus}`);
                 this.status = newStatus;
                 this.onStatusChange();
             }
@@ -284,12 +247,12 @@ class CastManager {
         if (this.player && this.connected && this.status === 'ACTIVE') return true;
 
         return new Promise((resolve) => {
-            this.logger.info(`[Cast] Attempting manual connection to ${ip}...`);
+            logger.info(`[Cast] Attempting manual connection to ${ip}...`);
             this.client = new Client();
 
             const client = this.client!;
             client.on('error', (err: Error) => {
-                this.logger.error(`[Cast] Client error event: ${getErrorMessage(err)}`);
+                logger.error(`[Cast] Client error event: ${getErrorMessage(err)}`);
                 this.dispose('OFFLINE');
                 resolve(false);
             });
@@ -297,13 +260,13 @@ class CastManager {
             client.connect({ host: ip, port: 8009 }, () => {
                 client.launch(DefaultMediaReceiver, (err: Error | null, player: CastPlayer) => {
                     if (err) {
-                        this.logger.error(`[Cast] Launch failed: ${err?.message || err}`);
+                        logger.error(`[Cast] Launch failed: ${err?.message || err}`);
                         this.dispose('OFFLINE');
                         resolve(false);
                     } else {
                         this.player = player;
                         this.connected = true;
-                        this.logger.success(`[Cast] Connected successfully. Status: ${this.status} -> ACTIVE`);
+                        logger.success(`[Cast] Connected successfully. Status: ${this.status} -> ACTIVE`);
                         this.status = 'ACTIVE';
                         this.onStatusChange();
                         resolve(true);
@@ -315,9 +278,9 @@ class CastManager {
 
     load(url: string) {
         if (this.player) {
-            this.logger.debug(`[Cast] Loading image onto receiver: ${url}`);
+            logger.debug(`[Cast] Loading image onto receiver: ${url}`);
             this.player.load({ contentId: url, contentType: 'image/jpeg' }, { autoplay: true }, (err: Error | null) => {
-                if (err) this.logger.error(`[Cast] Player load error: ${err?.message || err}`);
+                if (err) logger.error(`[Cast] Player load error: ${err?.message || err}`);
             });
         }
     }
@@ -326,18 +289,20 @@ class CastManager {
         try {
             if (this.client) this.client.close();
         } catch {
-            console.warn('Could not close client connection.');
+            logger.warn('Could not close client connection.');
         }
         this.client = this.player = null;
         this.connected = false;
 
         if (this.status !== forceStatus) {
-            this.logger.info(`[Cast] Connection closed. Status: ${this.status} -> ${forceStatus}`);
+            logger.info(`[Cast] Connection closed. Status: ${this.status} -> ${forceStatus}`);
             this.status = forceStatus;
         }
         this.onStatusChange();
     }
 }
+
+// --------------------------------------------------------------------------
 
 class GeoProxy {
     private cache: Record<string, string> = {};
@@ -368,11 +333,13 @@ class GeoProxy {
             Deno.writeTextFileSync(GEO_CACHE_FILE, JSON.stringify(this.cache));
             return loc;
         } catch {
-            console.warn('Failed to fetch location data.');
+            logger.warn('Failed to fetch location data.');
             return '';
         }
     }
 }
+
+// --------------------------------------------------------------------------
 
 class ImageProcessor {
     private currentWorkerId = 0;
@@ -381,7 +348,7 @@ class ImageProcessor {
         try {
             Deno.mkdirSync(tempDir, { recursive: true });
         } catch {
-            console.warn('Could not create temp directory for image processing. Some features may not work correctly.');
+            logger.warn('Could not create temp directory for image processing. Some features may not work correctly.');
         }
     }
     getSafeName(p: string, i: number, trip: string) {
@@ -416,16 +383,16 @@ class ImageProcessor {
                             await new Deno.Command('exiftool', {
                                 args: ['-quiet', '-overwrite_original', '-TagsFromFile', p, '-Orientation', v],
                             }).output();
-                            this.logger.debug(`[Processor] Extracted high-res preview (${width}px) using ${tag} from ${p}`);
+                            logger.debug(`[Processor] Extracted high-res preview (${width}px) using ${tag} from ${p}`);
                             return true;
                         } else {
-                            this.logger.debug(`[Processor] Preview from ${tag} too small (${width}px). Discarding ${p}.`);
+                            logger.debug(`[Processor] Preview from ${tag} too small (${width}px). Discarding ${p}.`);
                             await Deno.remove(v);
                         }
                     } else await Deno.remove(v);
                 }
             } catch {
-                this.logger.debug(`Could not process image. ${basename(p)}`);
+                logger.debug(`Could not process image. ${basename(p)}`);
             }
         }
         return false;
@@ -438,7 +405,7 @@ class ImageProcessor {
         try {
             const stats = await Deno.stat(outPath);
             if (stats.isFile && stats.size > 0) {
-                this.logger.debug(`[Cache Hit] Item ${index}: ${outName}`);
+                logger.debug(`[Cache Hit] Item ${index}: ${outName}`);
                 if (gen === this.currentWorkerId) {
                     this.readyMap.add(index);
                     this.onReady(index);
@@ -446,11 +413,11 @@ class ImageProcessor {
                 return;
             }
         } catch {
-            this.logger.debug(`[Cache Miss] Item ${index}: ${outName}`);
+            logger.debug(`[Cache Miss] Item ${index}: ${outName}`);
         }
 
         try {
-            this.logger.debug(`[Processor] Cache Miss: Generating ${index} (${basename(path)})...`);
+            logger.debug(`[Processor] Cache Miss: Generating ${index} (${basename(path)})...`);
             let input = path;
             const scratch = join(this.tempDir, `pre_${index}.jpg`);
             let scratchRaw = join(this.tempDir, `raw_${index}.tiff`);
@@ -466,7 +433,7 @@ class ImageProcessor {
                     for (const tool of tools) {
                         if (rawDeveloped) break;
                         try {
-                            this.logger.debug(`[Processor] Attempting RAW decode with ${tool}...`);
+                            logger.debug(`[Processor] Attempting RAW decode with ${tool}...`);
                             const rawCmd = new Deno.Command(tool, { args: ['-c', '-w', '-T', path] });
                             const { code, stdout } = await rawCmd.output();
                             if (code === 0 && stdout.length > 5000) {
@@ -474,15 +441,15 @@ class ImageProcessor {
                                 input = scratchRaw;
                                 cleanupRaw = true;
                                 rawDeveloped = true;
-                                this.logger.debug(`[Processor] Successfully decoded RAW with libraw (${tool})`);
+                                logger.debug(`[Processor] Successfully decoded RAW with libraw (${tool})`);
                             }
                         } catch (e) {
-                            this.logger.debug(`[Processor] Failed to decode RAW with ${tool}`);
+                            logger.debug(`[Processor] Failed to decode RAW with ${tool}`);
                         }
                     }
                     if (!rawDeveloped && Deno.build.os === 'darwin') {
                         try {
-                            this.logger.debug(`[Processor] Attempting RAW decode with macOS native sips...`);
+                            logger.debug(`[Processor] Attempting RAW decode with macOS native sips...`);
                             scratchRaw = join(this.tempDir, `raw_${index}.jpg`);
                             const sipsCmd = new Deno.Command('sips', {
                                 args: ['-s', 'format', 'jpeg', '-Z', '1920', path, '--out', scratchRaw],
@@ -492,14 +459,14 @@ class ImageProcessor {
                                 input = scratchRaw;
                                 cleanupRaw = true;
                                 rawDeveloped = true;
-                                this.logger.debug(`[Processor] Successfully decoded RAW with macOS sips`);
+                                logger.debug(`[Processor] Successfully decoded RAW with macOS sips`);
                             }
                         } catch (e) {
-                            this.logger.debug(`[Processor] Failed to decode RAW with macOS sips`);
+                            logger.debug(`[Processor] Failed to decode RAW with macOS sips`);
                         }
                     }
                     if (!rawDeveloped) {
-                        this.logger.error(
+                        logger.error(
                             `[Processor] Skipping ${basename(path)}: No valid image format could be extracted.`,
                         );
                         shouldProcess = false;
@@ -534,16 +501,16 @@ class ImageProcessor {
                 try {
                     await Deno.remove(input);
                 } catch {
-                    this.logger.debug(`[Processor] Failed to remove temporary RAW file: ${input}`);
+                    logger.debug(`[Processor] Failed to remove temporary RAW file: ${input}`);
                 }
             }
             try {
                 await Deno.remove(scratch);
             } catch {
-                this.logger.debug(`[Processor] Failed to remove temporary scratch file: ${scratch}`);
+                logger.debug(`[Processor] Failed to remove temporary scratch file: ${scratch}`);
             }
 
-            this.logger.debug(`[Processor] Magick finished item ${index}: ${outPath}`);
+            logger.debug(`[Processor] Magick finished item ${index}: ${basename(outPath)}`);
             if (exif['GPS Latitude'] && exif['GPS Longitude']) {
                 exif['pc_location'] = await geo.getCity(exif['GPS Latitude'], exif['GPS Longitude']);
             }
@@ -553,13 +520,13 @@ class ImageProcessor {
                 this.onReady(index);
             }
         } catch (e) {
-            this.logger.error(`[Processor] Item ${index} failed: ${getErrorMessage(e)}`);
+            logger.error(`[Processor] Item ${index} failed: ${getErrorMessage(e)}`);
         }
     }
 
     async runWorker(photos: PhotoEntry[], tripName: string, geo: GeoProxy) {
         const gen = this.currentWorkerId;
-        this.logger.info(`[Worker] Starting background processing for ${tripName} (${photos.length} items)`);
+        logger.info(`[Worker] Starting background processing for ${tripName} (${photos.length} items)`);
         for (let i = 0; i < photos.length; i++) {
             if (gen !== this.currentWorkerId) return;
             await this.process(photos[i].path, i, tripName, photos[i].exif, gen, geo);
@@ -596,6 +563,8 @@ class ImageProcessor {
     }
 }
 
+// --------------------------------------------------------------------------
+
 class PhotoCastSystem {
     private photoEntries: PhotoEntry[] = [];
     private currentIndex = 0;
@@ -609,7 +578,6 @@ class PhotoCastSystem {
     private sockets = new Set<WebSocket>();
     private processor: ImageProcessor;
     private cast: CastManager;
-    private logger: Logger;
     private geo: GeoProxy;
     private settings = DEFAULT_SETTINGS;
     private timeRemaining = 30;
@@ -621,16 +589,13 @@ class PhotoCastSystem {
     constructor(
         private configPath: string,
         private port: number,
-        private verbose: boolean,
-        private headless: boolean,
         private websitePath: string,
     ) {
-        this.logger = new Logger(verbose, headless);
         this.geo = new GeoProxy();
         const resolvedPath = isAbsolute(websitePath) ? websitePath : join(Deno.cwd(), websitePath);
         try {
             const info = Deno.statSync(resolvedPath);
-            this.logger.info(`Resolved website path: ${resolvedPath} (${info.isDirectory ? 'directory' : 'file'})`);
+            logger.info(`Resolved website path: ${resolvedPath} (${info.isDirectory ? 'directory' : 'file'})`);
             if (info.isDirectory) {
                 this.websiteDirPath = resolvedPath;
                 this.websiteIndexFile = this.findWebsiteIndex(resolvedPath);
@@ -641,18 +606,18 @@ class PhotoCastSystem {
                 throw new Error('Website path must be a directory or an HTML file.');
             }
         } catch (e) {
-            this.logger.error(`Website file error: ${getErrorMessage(e)}`);
+            logger.error(`Website file error: ${getErrorMessage(e)}`);
             Deno.exit(1);
         }
 
         try {
             this.settings = JSON.parse(Deno.readTextFileSync(SETTINGS_FILE));
         } catch {
-            this.logger.warn('No existing settings found. Using defaults.');
+            logger.warn('No existing settings found. Using defaults.');
             this.settings = DEFAULT_SETTINGS;
         }
 
-        this.processor = new ImageProcessor(BASE_CACHE_DIR, this.logger, (idx) => {
+        this.processor = new ImageProcessor(CACHE_DIR, logger, (idx) => {
             if (idx === -1) {
                 this.isScanning = false;
                 this.broadcastState(true);
@@ -667,7 +632,7 @@ class PhotoCastSystem {
             }
         });
 
-        this.cast = new CastManager(this.settings.ip, this.logger, () => this.broadcastState());
+        this.cast = new CastManager(this.settings.ip, logger, () => this.broadcastState());
         this.timeRemaining = this.settings.timeout;
 
         this.setupRoutes();
@@ -680,7 +645,7 @@ class PhotoCastSystem {
                 if (this.cast.connected && this.cast.status === 'ACTIVE') {
                     const now = Date.now();
                     if (now - this.lastCastTime >= 60000) {
-                        this.logger.info(
+                        logger.info(
                             '[Anti-Screensaver] Paused for 60s, resending image to keep Chromecast active.',
                         );
                         this.lastCastTime = now;
@@ -698,7 +663,7 @@ class PhotoCastSystem {
     private watchHtmlFile() {
         try {
             const watcher = Deno.watchFs(this.websiteIndexFile);
-            this.logger.info(`[Watcher] Watching HTML file: ${this.websiteIndexFile}`);
+            logger.info(`[Watcher] Watching HTML file: ${this.websiteIndexFile}`);
 
             let debounceTimer: number | null = null;
             (async () => {
@@ -706,14 +671,14 @@ class PhotoCastSystem {
                     if (event.kind === 'modify') {
                         if (debounceTimer) clearTimeout(debounceTimer);
                         debounceTimer = setTimeout(() => {
-                            this.logger.info('[Watcher] HTML file modified. Reloading clients.');
+                            logger.info('[Watcher] HTML file modified. Reloading clients.');
                             this.broadcast({ type: 'RELOAD' });
                         }, 500) as unknown as number;
                     }
                 }
             })();
         } catch (e) {
-            this.logger.error(`[Watcher] Could not watch HTML: ${getErrorMessage(e)}`);
+            logger.error(`[Watcher] Could not watch HTML: ${getErrorMessage(e)}`);
         }
     }
 
@@ -748,7 +713,7 @@ class PhotoCastSystem {
         try {
             await Deno.writeTextFile(STATE_FILE, JSON.stringify(data));
         } catch {
-            console.warn('Could not save state file.');
+            logger.warn('Could not save state file.');
         }
     }
 
@@ -799,7 +764,7 @@ class PhotoCastSystem {
                 evt.preventDefault();
                 return;
             }
-            this.logger.debug(`[Server Error] ${msg}`);
+            logger.debug(`[Server Error] ${msg}`);
         });
 
         router.get('/ws', (ctx) => {
@@ -819,7 +784,7 @@ class PhotoCastSystem {
                     }
                     if (d.type === 'TOGGLE_PAUSE') {
                         this.isPaused = !this.isPaused;
-                        this.logger.info(`[Playback] Pause toggled: ${this.isPaused}`);
+                        logger.info(`[Playback] Pause toggled: ${this.isPaused}`);
                         this.broadcastState();
                     }
                     if (d.type === 'UPDATE_SETTINGS') {
@@ -830,7 +795,7 @@ class PhotoCastSystem {
                         this.broadcastState();
                     }
                 } catch {
-                    console.warn('Could not update settings.');
+                    logger.warn('Could not update settings.');
                 }
             };
             ws.onclose = () => this.sockets.delete(ws);
@@ -840,7 +805,7 @@ class PhotoCastSystem {
             const { trip, filename } = ctx.params;
             if (filename === 'status') {
                 try {
-                    ctx.response.body = await Deno.readFile(join(BASE_CACHE_DIR, 'status_frame.jpg'));
+                    ctx.response.body = await Deno.readFile(join(CACHE_DIR, 'status_frame.jpg'));
                     ctx.response.type = 'image/jpeg';
                 } catch {
                     ctx.response.status = 404;
@@ -851,7 +816,7 @@ class PhotoCastSystem {
             if (idx === -1) return ctx.response.status = 404;
             const safeName = this.processor.getSafeName(this.photoEntries[idx].path, idx, this.tripName);
             try {
-                ctx.response.body = await Deno.readFile(join(BASE_CACHE_DIR, safeName));
+                ctx.response.body = await Deno.readFile(join(CACHE_DIR, safeName));
                 ctx.response.type = 'image/jpeg';
             } catch {
                 ctx.response.status = 404;
@@ -878,7 +843,7 @@ class PhotoCastSystem {
                     }
                     if (hasFiles) validTrips.push(t);
                 } catch {
-                    console.warn('Could not read trip directory.');
+                    logger.warn('Could not read trip directory.');
                 }
             }
             ctx.response.body = validTrips.sort((a: TripItem, b: TripItem) =>
@@ -894,7 +859,7 @@ class PhotoCastSystem {
 
         router.get('/toggle-cast', async (ctx) => {
             this.isCasting = !this.isCasting;
-            this.logger.info(`[Cast] Toggle isCasting=${this.isCasting}`);
+            logger.info(`[Cast] Toggle isCasting=${this.isCasting}`);
             try {
                 if (this.isCasting) await this.refresh();
                 else this.cast.dispose('OFF');
@@ -908,7 +873,7 @@ class PhotoCastSystem {
                 };
             } catch (e) {
                 const errorMessage = getErrorMessage(e);
-                this.logger.error(`[Cast] Toggle refresh failed: ${errorMessage}`);
+                logger.error(`[Cast] Toggle refresh failed: ${errorMessage}`);
                 ctx.response.status = 500;
                 ctx.response.body = { status: 'error', message: errorMessage || 'Refresh failed' };
             }
@@ -931,15 +896,15 @@ class PhotoCastSystem {
                 this.settings = { ...this.settings, ...body };
                 try {
                     try {
-                        Deno.mkdirSync(BASE_CACHE_DIR, { recursive: true });
+                        Deno.mkdirSync(CACHE_DIR, { recursive: true });
                     } catch {
-                        console.warn(
+                        logger.warn(
                             'Could not create cache directory for settings. Changes will not be saved persistently.',
                         );
                     }
                     Deno.writeTextFileSync(SETTINGS_FILE, JSON.stringify(this.settings));
                 } catch (e) {
-                    this.logger.error(`[Settings] Write error: ${getErrorMessage(e)}`);
+                    logger.error(`[Settings] Write error: ${getErrorMessage(e)}`);
                 }
                 this.cast.updateIp(this.settings.ip);
                 this.timeRemaining = this.settings.timeout;
@@ -947,7 +912,7 @@ class PhotoCastSystem {
                 ctx.response.status = 200;
                 ctx.response.body = { status: 'ok', settings: this.settings };
             } catch (e) {
-                this.logger.error(`[Settings] Update failed: ${getErrorMessage(e)}`);
+                logger.error(`[Settings] Update failed: ${getErrorMessage(e)}`);
                 ctx.response.status = 400;
                 ctx.response.body = { status: 'error', message: 'bad request' };
             }
@@ -987,7 +952,7 @@ class PhotoCastSystem {
             ctx.response.body = await Deno.readTextFile(this.websiteIndexFile);
             ctx.response.type = 'text/html';
             // more ensuring no caching
-            ctx.response.headers.set('Cache-Control', 'no-cache');            
+            ctx.response.headers.set('Cache-Control', 'no-cache');
         });
 
         app.use(router.routes());
@@ -1018,7 +983,7 @@ class PhotoCastSystem {
                 this.lastCastTime = Date.now();
             }
         } catch (e) {
-            this.logger.error(`[Cast] Refresh exception: ${getErrorMessage(e)}`);
+            logger.error(`[Cast] Refresh exception: ${getErrorMessage(e)}`);
         }
     }
 
@@ -1064,7 +1029,7 @@ class PhotoCastSystem {
         const currentGen = this.processor.setTrip(this.tripName);
 
         try {
-            const out = join(BASE_CACHE_DIR, 'status_frame.jpg');
+            const out = join(CACHE_DIR, 'status_frame.jpg');
             await new Deno.Command('magick', {
                 args: [
                     '-size',
@@ -1085,14 +1050,14 @@ class PhotoCastSystem {
                 ],
             }).output();
         } catch (e) {
-            this.logger.error(`[Scanner] Failed to generate status image: ${getErrorMessage(e)}`);
+            logger.error(`[Scanner] Failed to generate status image: ${getErrorMessage(e)}`);
         }
 
         this.refresh();
         this.broadcastState();
 
         const tripPath = join(config.target, new Date(trip.start).getFullYear().toString(), trip.name);
-        this.logger.info(`[Scanner] Folder: ${tripPath}`);
+        logger.info(`[Scanner] Folder: ${tripPath}`);
 
         const rawFiles: Record<string, string> = {};
         try {
@@ -1104,23 +1069,11 @@ class PhotoCastSystem {
                 if (!existingExt || (ext === '.jpg' || ext === '.jpeg')) rawFiles[base] = join(tripPath, e.name);
             }
         } catch (e) {
-            this.logger.error(`[Scanner] Failed to read trip directory: ${getErrorMessage(e)}`);
+            logger.error(`[Scanner] Failed to read trip directory: ${getErrorMessage(e)}`);
             return;
         }
 
         const files = Object.values(rawFiles);
-        // if (files.length === 0) {
-        //   this.isScanning = false;
-        //   try {
-        //     const out = join(BASE_CACHE_DIR, "status_frame.jpg");
-        //     await new Deno.Command("magick", {
-        //       args: ["-size", "1920x1080", "canvas:black", "-font", FONT_PATH, "-fill", "white", "-pointsize", "60", "-gravity", "north", "-annotate", "+0+360", `Album Empty:\n${this.tripName}`, out],
-        //     }).output();
-        //   } catch (e) {}
-        //   this.refresh();
-        //   this.broadcastState();
-        //   return;
-        // }
 
         const metadata: PhotoEntry[] = [];
         for (let i = 0; i < files.length; i += 50) {
@@ -1192,20 +1145,22 @@ class PhotoCastSystem {
         try {
             restored = JSON.parse(await Deno.readTextFile(STATE_FILE));
         } catch (e) {
-            console.warn('Could not restore previous state.');
+            logger.warn('Could not restore previous state.');
         }
         await this.selectTrip(undefined, initialSearch, restored);
     }
 }
 
+// --------------------------------------------------------------------------
+// main
 const program = new Command();
-program.description('photocast - Cast albums to Chromecast')
+program.description(`${PROGRAM} - Cast albums to Chromecast`)
     .option('-i, --ip <string>', 'Chromecast IP', DEFAULT_SETTINGS.ip)
     .option('-p, --port <number>', 'Local web port', DEFAULT_SETTINGS.port.toString())
     .option('-y, --yaml <string>', 'YAML', './trips.yml')
     .option('-v, --verbose', 'Debug', false)
     .option('--version', 'Show version', () => {
-        console.log(`photocast - version ${VERSION}`);
+        logger.info(`photocast - version ${VERSION}`);
         Deno.exit(0);
     })
     .option('-s, --search <string>', 'Search')
@@ -1214,17 +1169,23 @@ program.description('photocast - Cast albums to Chromecast')
     .option('--website <string>', 'Website folder or HTML entry file', './website');
 
 program.parse(process.argv);
-const o = program.opts();
+const options = program.opts();
 
-// --- BACKGROUND DAEMONIZER ---
-if (o.headless && !Deno.env.get('PHOTOCAST_BACKGROUND')) {
-    console.log('🚀 Spawning photocast in the background...');
+if( options.verbose) setLogLevel('DEBUG');
+if( options.headless) setLogFile( LOG_FILE)
+
+// daemonise the deno way
+if (options.headless && !Deno.env.get('PHOTOCAST_BACKGROUND')) {
+
+    // logger.info('🚀 Spawning photocast in the background...');
 
     const execName = basename(Deno.execPath()).toLowerCase();
     const isCompiled = execName !== 'deno' && execName !== 'deno.exe';
 
+    // handle a compiled version, the args will be different
     const args = isCompiled ? [...Deno.args] : ['run', '-A', import.meta.url, ...Deno.args];
 
+    // relaunch the app again
     const child = new Deno.Command(Deno.execPath(), {
         args: args,
         stdin: 'null',
@@ -1234,29 +1195,28 @@ if (o.headless && !Deno.env.get('PHOTOCAST_BACKGROUND')) {
     }).spawn();
 
     child.unref();
-    console.log(`✅ Background process spawned (PID: ${child.pid}). You can close this terminal.`);
-    console.log(`📝 Logs are being written to: /tmp/${USER}/photocast/photocast.log`);
+    // logger.info(`✅ Background process spawned (PID: ${child.pid}). You can close this terminal.`);
+    logger.info(`📝 Logs are being written to: ${getLogFile()}`);
     Deno.exit(0);
 }
-// -----------------------------
 
-if (o.clearCache) {
+if (options.clearCache) {
     try {
         await purgeCacheKeepSettings();
-        console.log('Cache Wiped.');
+        logger.info('Cache Wiped.');
     } catch {
-        console.warn('Could not clear cache.');
+        logger.warn('Could not clear cache.');
     }
 }
-if (o.website) {
+if (options.website) {
     try {
-        await Deno.stat(isAbsolute(o.website) ? o.website : join(Deno.cwd(), o.website));
+        await Deno.stat(isAbsolute(options.website) ? options.website : join(Deno.cwd(), options.website));
     } catch (e) {
-        console.error(`Website path error: ${getErrorMessage(e)}`);
+        logger.error(`Website path error: ${getErrorMessage(e)}`);
         Deno.exit(1);
     }
 }
 
-const isRunningAsDaemon = !!Deno.env.get('PHOTOCAST_BACKGROUND');
+// const isRunningAsDaemon = !!Deno.env.get('PHOTOCAST_BACKGROUND');
 
-new PhotoCastSystem(o.yaml, parseInt(o.port), o.verbose, isRunningAsDaemon, o.website).start(o.search);
+new PhotoCastSystem(options.yaml, parseInt(options.port), options.website).start(options.search);
