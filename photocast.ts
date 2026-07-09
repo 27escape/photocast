@@ -11,6 +11,8 @@ import { basename, dirname, extname, isAbsolute, join, parse as parsePath } from
 import process from 'node:process';
 
 const VERSION = '1.0.0';
+const DEFAULT_PORT = 7080 ;
+const GOOGLE_CAST_PORT = 8009;
 
 // --- GLOBAL DENO NOISE FILTER ---
 const networkErrors = [
@@ -148,7 +150,7 @@ type CastClient = {
     close: () => void;
 };
 
-const DEFAULT_SETTINGS: Settings = { ip: '192.168.0.216', timeout: 30, port: 8080 };
+const DEFAULT_SETTINGS: Settings = { ip: '192.168.0.216', timeout: 30, port: DEFAULT_PORT };
 const LOCAL_IP = Deno.networkInterfaces().find((i) => i.family === 'IPv4' && !i.address.startsWith('127.'))?.address ||
     'localhost';
 
@@ -267,7 +269,7 @@ class CastManager {
     private async probe(): Promise<boolean> {
         if (!this.ip) return false;
         try {
-            const conn = await Deno.connect({ hostname: this.ip, port: 8009 });
+            const conn = await Deno.connect({ hostname: this.ip, port: GOOGLE_CAST_PORT, transport: 'tcp' });
             conn.close();
             return true;
         } catch {
@@ -414,16 +416,16 @@ class ImageProcessor {
                             await new Deno.Command('exiftool', {
                                 args: ['-quiet', '-overwrite_original', '-TagsFromFile', p, '-Orientation', v],
                             }).output();
-                            this.logger.debug(`[Processor] Extracted high-res preview (${width}px) using ${tag}`);
+                            this.logger.debug(`[Processor] Extracted high-res preview (${width}px) using ${tag} from ${p}`);
                             return true;
                         } else {
-                            this.logger.debug(`[Processor] Preview from ${tag} too small (${width}px). Discarding.`);
+                            this.logger.debug(`[Processor] Preview from ${tag} too small (${width}px). Discarding ${p}.`);
                             await Deno.remove(v);
                         }
                     } else await Deno.remove(v);
                 }
             } catch {
-                console.warn('Could not process image.');
+                this.logger.debug(`Could not process image. ${basename(p)}`);
             }
         }
         return false;
@@ -541,7 +543,7 @@ class ImageProcessor {
                 this.logger.debug(`[Processor] Failed to remove temporary scratch file: ${scratch}`);
             }
 
-            this.logger.debug(`[Processor] Magick finished item ${index}`);
+            this.logger.debug(`[Processor] Magick finished item ${index}: ${outPath}`);
             if (exif['GPS Latitude'] && exif['GPS Longitude']) {
                 exif['pc_location'] = await geo.getCity(exif['GPS Latitude'], exif['GPS Longitude']);
             }
@@ -628,7 +630,7 @@ class PhotoCastSystem {
         const resolvedPath = isAbsolute(websitePath) ? websitePath : join(Deno.cwd(), websitePath);
         try {
             const info = Deno.statSync(resolvedPath);
-            console.log(`Resolved website path: ${resolvedPath} (${info.isDirectory ? 'directory' : 'file'})`);
+            this.logger.info(`Resolved website path: ${resolvedPath} (${info.isDirectory ? 'directory' : 'file'})`);
             if (info.isDirectory) {
                 this.websiteDirPath = resolvedPath;
                 this.websiteIndexFile = this.findWebsiteIndex(resolvedPath);
@@ -639,14 +641,14 @@ class PhotoCastSystem {
                 throw new Error('Website path must be a directory or an HTML file.');
             }
         } catch (e) {
-            console.error(`Website file error: ${getErrorMessage(e)}`);
+            this.logger.error(`Website file error: ${getErrorMessage(e)}`);
             Deno.exit(1);
         }
 
         try {
             this.settings = JSON.parse(Deno.readTextFileSync(SETTINGS_FILE));
         } catch {
-            console.warn('No existing settings found. Using defaults.');
+            this.logger.warn('No existing settings found. Using defaults.');
             this.settings = DEFAULT_SETTINGS;
         }
 
@@ -955,6 +957,8 @@ class PhotoCastSystem {
             try {
                 ctx.response.body = await Deno.readFile(filePath);
                 ctx.response.type = contentType;
+                //  make sure files like sw.js are not cached by the browser
+                ctx.response.headers.set('Cache-Control', 'no-cache');
             } catch {
                 ctx.response.status = 404;
             }
@@ -982,6 +986,8 @@ class PhotoCastSystem {
         router.get('/', async (ctx) => {
             ctx.response.body = await Deno.readTextFile(this.websiteIndexFile);
             ctx.response.type = 'text/html';
+            // more ensuring no caching
+            ctx.response.headers.set('Cache-Control', 'no-cache');            
         });
 
         app.use(router.routes());
@@ -1192,10 +1198,10 @@ class PhotoCastSystem {
     }
 }
 
-const p = new Command();
-p.description('photocast - Cast albums to Chromecast')
-    .option('-i, --ip <string>', 'Cast IP', DEFAULT_SETTINGS.ip)
-    .option('-p, --port <number>', 'Local port', DEFAULT_SETTINGS.port.toString())
+const program = new Command();
+program.description('photocast - Cast albums to Chromecast')
+    .option('-i, --ip <string>', 'Chromecast IP', DEFAULT_SETTINGS.ip)
+    .option('-p, --port <number>', 'Local web port', DEFAULT_SETTINGS.port.toString())
     .option('-y, --yaml <string>', 'YAML', './trips.yml')
     .option('-v, --verbose', 'Debug', false)
     .option('--version', 'Show version', () => {
@@ -1207,8 +1213,8 @@ p.description('photocast - Cast albums to Chromecast')
     .option('-c, --clear-cache', 'Wipe Cache', false)
     .option('--website <string>', 'Website folder or HTML entry file', './website');
 
-p.parse(process.argv);
-const o = p.opts();
+program.parse(process.argv);
+const o = program.opts();
 
 // --- BACKGROUND DAEMONIZER ---
 if (o.headless && !Deno.env.get('PHOTOCAST_BACKGROUND')) {

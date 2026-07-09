@@ -525,7 +525,10 @@
       let connectTimeout;
       function connect() {
         clearTimeout(connectTimeout);
-        socket = new WebSocket("ws://" + location.host + "/ws");
+        // socket = new WebSocket("ws://" + location.host + "/ws");
+        const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        socket = new WebSocket(`${wsProtocol}//${location.host}/ws`);
+
         socket.onmessage = (e) => {
           const m = JSON.parse(e.data);
           
