@@ -203,7 +203,7 @@ class CastManager {
     public ip: string | null = null;
     public connected = false;
 
-    constructor(ip: string | null, private logger: Logger, private onStatusChange: () => void) {
+    constructor(ip: string | null, private onStatusChange: () => void) {
         this.ip = ip;
         this.startHeartbeat();
     }
@@ -266,7 +266,7 @@ class CastManager {
                     } else {
                         this.player = player;
                         this.connected = true;
-                        logger.success(`[Cast] Connected successfully. Status: ${this.status} -> ACTIVE`);
+                        logger.info(`[Cast] Connected successfully. Status: ${this.status} -> ACTIVE`);
                         this.status = 'ACTIVE';
                         this.onStatusChange();
                         resolve(true);
@@ -344,7 +344,7 @@ class GeoProxy {
 class ImageProcessor {
     private currentWorkerId = 0;
     public readyMap = new Set<number>();
-    constructor(private tempDir: string, private logger: Logger, private onReady: (idx: number) => void) {
+    constructor(private tempDir: string, private onReady: (idx: number) => void) {
         try {
             Deno.mkdirSync(tempDir, { recursive: true });
         } catch {
@@ -617,7 +617,7 @@ class PhotoCastSystem {
             this.settings = DEFAULT_SETTINGS;
         }
 
-        this.processor = new ImageProcessor(CACHE_DIR, logger, (idx) => {
+        this.processor = new ImageProcessor(CACHE_DIR, (idx) => {
             if (idx === -1) {
                 this.isScanning = false;
                 this.broadcastState(true);
@@ -632,7 +632,7 @@ class PhotoCastSystem {
             }
         });
 
-        this.cast = new CastManager(this.settings.ip, logger, () => this.broadcastState());
+        this.cast = new CastManager(this.settings.ip, () => this.broadcastState());
         this.timeRemaining = this.settings.timeout;
 
         this.setupRoutes();
