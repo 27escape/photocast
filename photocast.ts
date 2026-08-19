@@ -14,13 +14,46 @@ import { logger, setLogFile, getLogFile, setLogLevel } from '../various_tools/li
 
 const PROGRAM = 'photocast';
 const VERSION = '1.1.0';
-const DEFAULT_PORT = 7080 ;
+const DEFAULT_PORT = 7080;
+
+// Resolves the default website directory relative to where photocast itself
+// lives, not the process's working directory - so it can be launched from
+// anywhere (a systemd unit with a different cwd, a symlink on PATH, a cron
+// job, etc.) and still find its own bundled website/ folder without needing
+// --website passed every time. Two different mechanisms are needed depending
+// on how the program is actually running:
+//   - `deno run photocast.ts`: import.meta.dirname gives the real directory
+//     containing this source file on disk.
+//   - a `deno compile`-d binary: import.meta.dirname doesn't correspond to a
+//     real host filesystem path (the source is embedded in the binary's own
+//     virtual filesystem) - Deno.execPath() is what reliably gives the
+//     binary's actual location on disk in that case. Confirmed against
+//     Deno's own docs/discussions: execPath() returns the `deno` CLI's own
+//     path under `deno run`, but the compiled binary's own path when running
+//     as a standalone executable - so trying import.meta.dirname first and
+//     falling back to dirname(Deno.execPath()) if that doesn't resolve to a
+//     real directory covers both cases correctly.
+function resolveDefaultWebsiteDir(): string {
+    const sourceDir = import.meta.dirname;
+    if (sourceDir) {
+        try {
+            const info = Deno.statSync(sourceDir);
+            if (info.isDirectory) return join(sourceDir, 'website');
+        } catch {
+            // Not a real host path - almost certainly running as a compiled
+            // binary, where import.meta.dirname doesn't resolve to disk.
+        }
+    }
+    return join(dirname(Deno.execPath()), 'website');
+}
+const DEFAULT_WEBSITE_DIR = resolveDefaultWebsiteDir();
 const GOOGLE_CAST_PORT = 8009;
 
 // Determine dynamic logfile path based on program name and system user
 const USER = Deno.env.get('USER') || Deno.env.get('USERNAME') || 'unknown_user';
 
-const { Client, DefaultMediaReceiver } = castv2;
+// deno-lint-ignore no-explicit-any
+const { Client, DefaultMediaReceiver } = castv2 as any;
 // castv2-client's DefaultMediaReceiver normally exposes this as a static APP_ID,
 // but that's worth double-checking against the installed version - falling back
 // to the well-known literal keeps verifyStartupState() working either way.
@@ -45,6 +78,43 @@ const LOG_FILE = join(USER_CACHE_DIR, PROGRAM);
 // right tradeoff. The default (non-persistent) view root also nests here.
 const SCRATCH_DIR = `/tmp/${USER}/photocast`;
 
+// DefaultMediaReceiver mode has no way to render a caption itself (unlike the
+// custom receiver, which does it client-side) - the only option is to bake
+// title/year/location into the image before serving it. Measured at ~130ms
+// per composite on real hardware, comfortably fast for a single photo change
+// but not something to redo on every individual swipe in a rapid burst -
+// CAPTION_DEBOUNCE_MS lets a burst of swipes settle on one photo first.
+const CAST_COMPOSITE_FILE = join(SCRATCH_DIR, 'cast_composite.jpg');
+const CAPTION_DEBOUNCE_MS = 250;
+
+const CAST_TITLE_SIZE = 36;
+const CAST_SMALL_SIZE = 18; // 50% of title - used for both the year and location
+const CAST_BAND_OPACITY = 0.1;
+const CAST_MARGIN = 40; // left/right margin for text, matches the original layout's spacing
+const CAST_BAND_PADDING = 6; // "a couple of pixels" top and bottom around the text
+const CAST_STACK_GAP = 4; // gap between the stacked title/year lines
+
+// Typical font metrics run close to 1.2x pointsize once ascender/descender
+// space is included - used only to size the band tightly around its actual
+// content rather than a fixed guess. Worth eyeballing once rendered; this is
+// an approximation, not a real text-metrics measurement.
+const CAST_LINE_HEIGHT_RATIO = 1.2;
+const CAST_TITLE_LINE_H = Math.round(CAST_TITLE_SIZE * CAST_LINE_HEIGHT_RATIO);
+const CAST_SMALL_LINE_H = Math.round(CAST_SMALL_SIZE * CAST_LINE_HEIGHT_RATIO);
+
+// Band height = the taller of the two content blocks (right side: stacked
+// title+year; left side: location alone) plus padding top and bottom. The
+// right side (title+year stacked) is always the taller one whenever a year
+// is present, which is the common case.
+const CAST_BAND_HEIGHT = CAST_TITLE_LINE_H + CAST_STACK_GAP + CAST_SMALL_LINE_H + 2 * CAST_BAND_PADDING;
+
+// Y-offsets (from the bottom of the image) for each text element, all
+// measured with the same gravity convention ImageMagick uses: larger Y is
+// further up from the bottom edge.
+const CAST_YEAR_Y = CAST_BAND_PADDING;
+const CAST_TITLE_Y = CAST_BAND_PADDING + CAST_SMALL_LINE_H + CAST_STACK_GAP;
+const CAST_LOCATION_Y = CAST_BAND_PADDING; // aligned with the year's baseline, for visual balance
+
 // Bump this whenever the magick pipeline (resize/sharpen/etc) changes, to force
 // existing rendered images to be regenerated without touching the EXIF/scan
 // cache or requiring a full directory rescan.
@@ -58,7 +128,8 @@ const PHOTO_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.dng', '.orf', '.nef', '.arw
 // the edited JPG still be recognized as "the" photo for that base name, so
 // the RAW gets skipped in its favor rather than both being kept as separate
 // photos. Add more suffixes here as you run into other tools/exports.
-const EDIT_SUFFIX_PATTERN = /[_-](dxo|topaz|edit(ed)?)$/i;
+// const EDIT_SUFFIX_PATTERN = /[_-](dxo|topaz|edit(ed)?)$/i;
+const EDIT_SUFFIX_PATTERN = /(dxo|topaz|edit(ed)?)$/i;
 
 function canonicalPhotoBase(fileNameWithoutExt: string): string {
     return fileNameWithoutExt.replace(EDIT_SUFFIX_PATTERN, '');
@@ -319,6 +390,17 @@ function normalizeExifTimestamp(raw: string): string {
     return `${y}:${mo}:${d} ${h}:${mi}:${s}`;
 }
 
+// Trip names are always "YYYY-MM-DD title" or "YYYY-MM title" - split into
+// the two pieces the Chromecast overlay displays differently (title at full
+// size, year at 50%, stacked underneath). Falls back to treating the whole
+// name as the title if it doesn't match that shape, rather than guessing or
+// crashing.
+function parseTripTitle(tripName: string): { title: string; year: string | null } {
+    const match = tripName.match(/^(\d{4})-\d{2}(?:-\d{2})?\s+(.+)$/);
+    if (match) return { title: match[2], year: match[1] };
+    return { title: tripName, year: null };
+}
+
 function formatShutter(ss: string): string {
     const val = parseFloat(ss);
     if (isNaN(val)) return ss;
@@ -419,7 +501,10 @@ class CastManager {
     // a session we didn't observe ourselves launching.
     public foreignSession = false;
 
-    constructor(ip: string | null, private onStatusChange: () => void) {
+    constructor(
+        ip: string | null,
+        private onStatusChange: () => void,
+    ) {
         this.ip = ip;
         this.startHeartbeat();
     }
@@ -530,11 +615,11 @@ class CastManager {
         }
 
         if (result.appId === DEFAULT_MEDIA_RECEIVER_APP_ID) {
-            // A DefaultMediaReceiver session is already live. We did not launch it
-            // in this process, so we don't know if it's healthy or stale - we
-            // deliberately do NOT auto-attach/join it. Surfacing it as active lets
-            // the UI reflect reality; the user can still explicitly toggle casting,
-            // which will launch a fresh session on top of it.
+            // A DefaultMediaReceiver session is already live. We did not
+            // launch it in this process, so we don't know if it's healthy or
+            // stale - we deliberately do NOT auto-attach/join it. Surfacing
+            // it as active lets the UI reflect reality; the user can still
+            // explicitly toggle casting, which will launch a fresh session.
             logger.info(`[Cast] Startup check: found an existing DefaultMediaReceiver session (${result.sessionId}).`);
             this.status = 'ACTIVE';
             this.foreignSession = false;
@@ -547,18 +632,18 @@ class CastManager {
         return 'foreign';
     }
 
-    // deno-lint-ignore require-await
     async connect(): Promise<boolean> {
         const ip = this.ip;
         if (!ip) return false;
-        if (this.player && this.connected && this.status === 'ACTIVE') return true;
+        if (this.connected && this.status === 'ACTIVE' && this.player) return true;
 
-        // verifyStartupState() only ran once, at process start - by the time
-        // a later /toggle-cast happens, hours could have passed and someone
-        // else could be using the device. This won't stop an explicit user
-        // action from taking over (that's normal Chromecast behavior - any
-        // sender app does this), but it keeps `foreignSession` truthful for
-        // the UI instead of only being accurate in the first few seconds.
+        // verifyStartupState() only ran once, at process start - by the
+        // time a later /toggle-cast happens, hours could have passed and
+        // someone else could be using the device. This won't stop an
+        // explicit user action from taking over (that's normal Chromecast
+        // behavior - any sender app does this), but it keeps
+        // `foreignSession` truthful for the UI instead of only being
+        // accurate in the first few seconds.
         const status = await this.probeStatus();
         if (status?.appId && status.appId !== DEFAULT_MEDIA_RECEIVER_APP_ID) {
             logger.warn(`[Cast] Taking over from a different application (${status.appId}) already running on the device.`);
@@ -572,46 +657,109 @@ class CastManager {
             this.client = new Client();
 
             const client = this.client!;
+            let settled = false;
+            const settle = (ok: boolean) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(connectTimeout);
+                resolve(ok);
+            };
+
+            // probeStatus() already has a timeout for the startup/foreign-
+            // session check, but the real connection attempt here never did -
+            // a device that's on the network but silently unresponsive (as
+            // opposed to actively refusing the connection) could otherwise
+            // hang a /toggle-cast indefinitely instead of failing cleanly.
+            const connectTimeout = setTimeout(() => {
+                logger.warn('[Cast] Connection attempt timed out.');
+                this.dispose('OFFLINE');
+                settle(false);
+            }, 8000);
+
             client.on('error', (err: Error) => {
                 logger.error(`[Cast] Client error event: ${getErrorMessage(err)}`);
                 this.dispose('OFFLINE');
-                resolve(false);
+                settle(false);
             });
 
-            client.connect({ host: ip, port: 8009 }, () => {
-                client.launch(DefaultMediaReceiver, (err: Error | null, player: CastPlayer) => {
+            client.connect({ host: ip, port: GOOGLE_CAST_PORT }, () => {
+                // deno-lint-ignore no-explicit-any
+                (client as any).launch(DefaultMediaReceiver, (err: Error | null, player: CastPlayer) => {
                     if (err) {
-                        logger.error(`[Cast] Launch failed: ${err?.message || err}`);
+                        logger.error(`[Cast] Launch failed: ${getErrorMessage(err)}`);
                         this.dispose('OFFLINE');
-                        resolve(false);
+                        settle(false);
                     } else {
                         this.player = player;
                         this.connected = true;
                         logger.info(`[Cast] Connected successfully. Status: ${this.status} -> ACTIVE`);
                         this.status = 'ACTIVE';
                         this.onStatusChange();
-                        resolve(true);
+                        settle(true);
                     }
                 });
             });
         });
     }
 
-    load(url: string) {
+    showPhoto(url: string, exif: ExifData) {
         if (this.player) {
             logger.debug(`[Cast] Loading image onto receiver: ${url}`);
             this.player.load({ contentId: url, contentType: 'image/jpeg' }, { autoplay: true }, (err: Error | null) => {
-                if (err) logger.error(`[Cast] Player load error: ${err?.message || err}`);
+                if (err) logger.error(`[Cast] Player load error: ${getErrorMessage(err)}`);
             });
         }
     }
 
+    // DefaultMediaReceiver has no separate status message - PhotoCastSystem
+    // just builds a URL pointing at the /img/.../status placeholder and
+    // calls showPhoto() with that instead. Kept as a no-op so callers don't
+    // need a special case for "am I mid-scan".
+    showStatus(_tripName: string, _scanPercent?: number) {}
+
     dispose(forceStatus: 'OFF' | 'OFFLINE' = 'OFF') {
-        try {
-            if (this.client) this.client.close();
-        } catch {
-            logger.warn('Could not close client connection.');
+        const client = this.client;
+        const appToStop = this.player;
+
+        const finishClose = () => {
+            try {
+                if (client) client.close();
+            } catch {
+                logger.warn('Could not close client connection.');
+            }
+        };
+
+        if (client && appToStop) {
+            // Tell the device to actually tear down the launched session,
+            // not just disconnect our own socket - confirmed via Google's
+            // own CastStatusCodes docs that a stale, never-stopped session
+            // is exactly what causes a later launch attempt for the same
+            // App ID to fail with CANCELED ("another action has preempted
+            // it"). The stop() call is given a moment to actually reach the
+            // device before the socket closes out from under it; dispose()
+            // itself still returns immediately rather than making every
+            // caller await this.
+            let closed = false;
+            const closeOnce = () => {
+                if (closed) return;
+                closed = true;
+                finishClose();
+            };
+            try {
+                // deno-lint-ignore no-explicit-any
+                (client as any).stop(appToStop, (err: Error | null) => {
+                    if (err) logger.debug(`[Cast] stop() reported: ${getErrorMessage(err)}`);
+                    closeOnce();
+                });
+            } catch (e) {
+                logger.debug(`[Cast] Could not send stop(): ${getErrorMessage(e)}`);
+                closeOnce();
+            }
+            setTimeout(closeOnce, 1000);
+        } else {
+            finishClose();
         }
+
         this.client = this.player = null;
         this.connected = false;
 
@@ -1431,6 +1579,12 @@ class PhotoCastSystem {
     private settings = DEFAULT_SETTINGS;
     private timeRemaining = 30;
     private lastCastTime = 0;
+    // Debounces caption-compositing in DefaultMediaReceiver mode so a burst
+    // of rapid swipes settles on one photo before paying the ~130ms
+    // compositing cost, rather than queuing up several that could complete
+    // out of order. Not used at all in custom-receiver mode, which renders
+    // captions client-side and needs no compositing.
+    private captionDebounceTimer: ReturnType<typeof setTimeout> | null = null;
     // Updated on any user-initiated navigation or trip selection (not the
     // auto-advance timer). Lets the sweeper back off entirely for a short
     // grace period rather than only skipping the currently-selected trip -
@@ -1484,8 +1638,20 @@ class PhotoCastSystem {
         try {
             this.settings = JSON.parse(Deno.readTextFileSync(SETTINGS_FILE));
         } catch {
-            logger.warn('No existing settings found. Using defaults.');
-            this.settings = DEFAULT_SETTINGS;
+            logger.warn('No existing settings found - writing defaults to disk.');
+            // Cloned rather than assigned directly - this.settings should
+            // never share DEFAULT_SETTINGS's own object identity, in case
+            // anything ever mutates it in place rather than replacing it.
+            this.settings = { ...DEFAULT_SETTINGS };
+            try {
+                Deno.mkdirSync(USER_CACHE_DIR, { recursive: true });
+                Deno.writeTextFileSync(SETTINGS_FILE, JSON.stringify(this.settings));
+            } catch (e) {
+                // Not fatal - the process can still run fine on in-memory
+                // defaults - but worth knowing settings.json isn't actually
+                // on disk yet if something depends on it existing.
+                logger.warn(`Could not write default settings to disk: ${getErrorMessage(e)}`);
+            }
         }
 
         this.processor = new ImageProcessor(SCRATCH_DIR, (idx) => {
@@ -1503,7 +1669,10 @@ class PhotoCastSystem {
             }
         });
 
-        this.cast = new CastManager(this.settings.ip, () => this.broadcastState());
+        this.cast = new CastManager(
+            this.settings.ip,
+            () => this.broadcastState(),
+        );
         this.timeRemaining = this.settings.timeout;
 
         this.setupRoutes();
@@ -1693,6 +1862,15 @@ class PhotoCastSystem {
             ws.onclose = () => this.sockets.delete(ws);
         });
 
+        router.get('/img/cast-composite.jpg', async (ctx) => {
+            try {
+                ctx.response.body = await Deno.readFile(CAST_COMPOSITE_FILE);
+                ctx.response.type = 'image/jpeg';
+            } catch {
+                ctx.response.status = 404;
+            }
+        });
+
         router.get('/img/:trip/:filename', async (ctx) => {
             const { trip, filename } = ctx.params;
             if (filename === 'status') {
@@ -1722,7 +1900,15 @@ class PhotoCastSystem {
         });
 
         router.get('/trips-list', async (ctx) => {
-            const config = parseYaml(await Deno.readTextFile(this.configPath)) as TripConfig;
+            let config: TripConfig;
+            try {
+                config = parseYaml(await Deno.readTextFile(this.configPath)) as TripConfig;
+            } catch (e) {
+                logger.error(`[Trips] Could not read ${this.configPath}: ${getErrorMessage(e)}`);
+                ctx.response.status = 500;
+                ctx.response.body = { error: `Could not read trips config: ${getErrorMessage(e)}` };
+                return;
+            }
             const validTrips: TripItem[] = [];
             for (const t of config.trips) {
                 const tripPath = join(config.target, new Date(t.start).getFullYear().toString(), t.name);
@@ -1835,6 +2021,12 @@ class PhotoCastSystem {
             await serveStaticFile(ctx, join(this.websiteDirPath, 'sw.js'), 'application/javascript');
         });
 
+        // Used by index.html's caption formatting - shared function so date/
+        // aperture/shutter/etc formatting only exists in one place.
+        router.get('/caption-format.js', async (ctx) => {
+            await serveStaticFile(ctx, join(this.websiteDirPath, 'caption-format.js'), 'application/javascript');
+        });
+
         router.get('/icons/:filename', async (ctx) => {
             const filename = ctx.params.filename;
             await serveStaticFile(ctx, join(this.websiteDirPath, 'icons', filename), 'image/png');
@@ -1861,7 +2053,14 @@ class PhotoCastSystem {
         if (this.isScanning || this.photoEntries.length === 0) return;
         const total = this.photoEntries.length;
         const direction = step >= 0 ? 1 : -1;
-        let next = (this.currentIndex + step + total) % total;
+        // A single "+ total" only correctly wraps a negative step whose
+        // magnitude is <= total (fine for +/-1 from swipe/next/prev, but not
+        // for jump-by-10/50 buttons on a trip with fewer photos than that).
+        // JS's % keeps the sign of the dividend rather than always returning
+        // a non-negative result, so a big negative step could leave `next`
+        // negative here - normalizing with modulo twice handles any integer
+        // step correctly regardless of magnitude.
+        let next = (((this.currentIndex + step) % total) + total) % total;
         // Skip over anything not rendered yet (early in a large trip's sweep,
         // or if the sweeper is still catching up on this one) rather than
         // landing on it and asking the Chromecast to load a file that isn't
@@ -1886,28 +2085,174 @@ class PhotoCastSystem {
 
             if (await this.cast.connect()) {
                 const tripSafe = this.tripName.replace(/[^a-z0-9]/gi, '_');
-                const showStatus = this.isScanning || this.photoEntries.length === 0 ||
-                    !this.processor.readyMap.has(this.currentIndex);
-                const url = showStatus
-                    ? `http://${LOCAL_IP}:${this.port}/img/${tripSafe}/status?t=${Date.now()}`
-                    : `http://${LOCAL_IP}:${this.port}/img/${tripSafe}/${
-                        basename(this.photoEntries[this.currentIndex].path)
-                    }?t=${Date.now()}`;
-                this.cast.load(url);
-                this.lastCastTime = Date.now();
+                const isReady = this.processor.readyMap.has(this.currentIndex);
+                const showStatus = this.isScanning || this.photoEntries.length === 0 || !isReady;
+
+                // A pending debounced composite from a previous call is no
+                // longer relevant the moment anything new happens here -
+                // status change or a further move - so always clear it first.
+                if (this.captionDebounceTimer) {
+                    clearTimeout(this.captionDebounceTimer);
+                    this.captionDebounceTimer = null;
+                }
+
+                if (showStatus) {
+                    // No separate status message on DefaultMediaReceiver -
+                    // just point the media player at the /img/.../status
+                    // placeholder image.
+                    const url = `http://${LOCAL_IP}:${this.port}/img/${tripSafe}/status?t=${Date.now()}`;
+                    this.cast.showPhoto(url, {});
+                    this.lastCastTime = Date.now();
+                    return;
+                }
+
+                const entry = this.photoEntries[this.currentIndex];
+
+                // Debounced: if the user swipes again before this fires, the
+                // clearTimeout() above cancels it - only the photo actually
+                // settled on pays the ~130ms compositing cost.
+                const targetIndex = this.currentIndex;
+                this.captionDebounceTimer = setTimeout(() => {
+                    this.captionDebounceTimer = null;
+                    if (this.currentIndex !== targetIndex || !this.isCasting) return; // moved on already
+                    this.composeCaptionedPhoto(entry).catch((e) =>
+                        logger.error(`[Cast] composeCaptionedPhoto failed: ${getErrorMessage(e)}`)
+                    );
+                }, CAPTION_DEBOUNCE_MS);
             }
         } catch (e) {
             logger.error(`[Cast] Refresh exception: ${getErrorMessage(e)}`);
         }
     }
 
+    // DefaultMediaReceiver mode's only way to show a caption at all - bakes
+    // time/album/location into the photo via ImageMagick (~130ms measured
+    // against real hardware) and serves that instead of the plain rendered
+    // JPG. Writes to a single fixed scratch path since only one composited
+    // image is ever "current" at a time; a fresh one simply overwrites it.
+    private async composeCaptionedPhoto(entry: PhotoEntry) {
+        const tripSafe = this.tripName.replace(/[^a-z0-9]/gi, '_');
+        const plainUrl = `http://${LOCAL_IP}:${this.port}/img/${tripSafe}/${basename(entry.path)}?t=${Date.now()}`;
+
+        if (!this.currentManifest) {
+            this.cast.showPhoto(plainUrl, {});
+            return;
+        }
+
+        try {
+            const sourcePath = join(this.currentManifest.dir, entry.viewFile);
+            const { title, year } = parseTripTitle(this.tripName);
+            const location = entry.exif.pc_location || '';
+
+            const args = [
+                sourcePath,
+                // Fit the whole photo within the frame, preserving aspect
+                // ratio - no crop. The previous `1920x1080^` forced a
+                // cover-crop, which is what was cutting portrait photos down
+                // to a landscape slice instead of showing them as portrait.
+                '-resize',
+                '1920x1080',
+                '-background',
+                'black',
+                '-gravity',
+                'center',
+                '-extent',
+                '1920x1080',
+                '(',
+                '-size',
+                `1920x${CAST_BAND_HEIGHT}`,
+                `xc:rgba(0,0,0,${CAST_BAND_OPACITY})`,
+                ')',
+                '-gravity',
+                'south',
+                '-compose',
+                'over',
+                '-composite',
+                // Title - right side, right-aligned. Each SouthEast-gravity
+                // annotate is independently right-anchored at the same X
+                // margin, so title and year (below) line up flush right
+                // regardless of how wide either one actually renders - no
+                // text-width measurement needed for this, unlike the
+                // previous inline-on-one-line layout.
+                '-gravity',
+                'southeast',
+                '-fill',
+                'white',
+                '-font',
+                FONT_PATH,
+                '-pointsize',
+                String(CAST_TITLE_SIZE),
+                '-annotate',
+                `+${CAST_MARGIN}+${CAST_TITLE_Y}`,
+                title,
+            ];
+
+            if (year) {
+                // Directly underneath the title, same right alignment.
+                args.push(
+                    '-pointsize',
+                    String(CAST_SMALL_SIZE),
+                    '-annotate',
+                    `+${CAST_MARGIN}+${CAST_YEAR_Y}`,
+                    year,
+                );
+            }
+
+            if (location) {
+                // Left side, roughly level with the year for visual balance.
+                args.push(
+                    '-gravity',
+                    'southwest',
+                    '-pointsize',
+                    String(CAST_SMALL_SIZE),
+                    '-annotate',
+                    `+${CAST_MARGIN}+${CAST_LOCATION_Y}`,
+                    location,
+                );
+            }
+
+            args.push(CAST_COMPOSITE_FILE);
+
+            await Deno.mkdir(dirname(CAST_COMPOSITE_FILE), { recursive: true });
+            const cmd = new Deno.Command('magick', { args });
+            const result = await cmd.output();
+            if (result.code !== 0) {
+                logger.error(`[Cast] Caption composite failed: ${new TextDecoder().decode(result.stderr)}`);
+                this.cast.showPhoto(plainUrl, {}); // show the plain photo rather than nothing
+                return;
+            }
+            const compositeUrl = `http://${LOCAL_IP}:${this.port}/img/cast-composite.jpg?t=${Date.now()}`;
+            this.cast.showPhoto(compositeUrl, {});
+            this.lastCastTime = Date.now();
+        } catch (e) {
+            logger.error(`[Cast] composeCaptionedPhoto error: ${getErrorMessage(e)}`);
+            this.cast.showPhoto(plainUrl, {}); // degrade to the plain photo rather than showing nothing
+        }
+    }
+
     public async selectTrip(name?: string, query?: string, restored?: RestoredState) {
         this.lastInteractionTime = Date.now();
+        if (this.captionDebounceTimer) {
+            clearTimeout(this.captionDebounceTimer);
+            this.captionDebounceTimer = null;
+        }
         const q = query || '';
         this.timeRemaining = this.settings.timeout;
         this.lastSentIndex = -1;
 
-        const config = parseYaml(await Deno.readTextFile(this.configPath)) as TripConfig;
+        let config: TripConfig;
+        try {
+            config = parseYaml(await Deno.readTextFile(this.configPath)) as TripConfig;
+        } catch (e) {
+            // Previously uncaught here, which crashed the entire process -
+            // including the web server - over what should just mean "no trip
+            // available right now." Now it logs clearly and leaves the
+            // system idle instead of taking the whole app down with it.
+            logger.error(`[Scanner] Could not read trips config at ${this.configPath}: ${getErrorMessage(e)}`);
+            this.isScanning = false;
+            this.broadcastState(true);
+            return;
+        }
         let trips = config.trips;
 
         // If we're restoring a session, try to find that same trip in the
@@ -1935,8 +2280,6 @@ class PhotoCastSystem {
 
         this.currentIndex = restoredIndex ?? 0;
 
-        this.isScanning = true;
-        this.scanPercent = 0;
         this.photoEntries = [];
         this.tripName = trip.name;
         // Clears the client-side view, not the on-disk cache - the previous
@@ -1944,34 +2287,6 @@ class PhotoCastSystem {
         // ready instantly if the user selects it again.
         this.broadcast({ type: 'CLEAR' });
         const currentGen = this.processor.setTrip(this.tripName);
-
-        try {
-            const out = STATUS_FRAME_FILE;
-            await new Deno.Command('magick', {
-                args: [
-                    '-size',
-                    '1920x1080',
-                    'canvas:black',
-                    '-font',
-                    FONT_PATH,
-                    '-fill',
-                    'white',
-                    '-pointsize',
-                    '60',
-                    '-gravity',
-                    'north',
-                    '-annotate',
-                    '+0+300',
-                    `Preparing Trip...\n${this.tripName}`,
-                    out,
-                ],
-            }).output();
-        } catch (e) {
-            logger.error(`[Scanner] Failed to generate status image: ${getErrorMessage(e)}`);
-        }
-
-        this.refresh();
-        this.broadcastState();
 
         const year = new Date(trip.start).getFullYear();
         this.currentTripYear = year;
@@ -1993,6 +2308,41 @@ class PhotoCastSystem {
         if (currentGen !== this.processor.generation) return;
 
         if (needsScan.length > 0) {
+            // Only now - once we actually know there's real work to do - do
+            // we show "Preparing Trip..." at all. Previously this was shown
+            // unconditionally before reconcile() even ran, so an already
+            // fully-processed trip still flashed the placeholder every time.
+            this.isScanning = true;
+            this.scanPercent = 0;
+
+            try {
+                const out = STATUS_FRAME_FILE;
+                await new Deno.Command('magick', {
+                    args: [
+                        '-size',
+                        '1920x1080',
+                        'canvas:black',
+                        '-font',
+                        FONT_PATH,
+                        '-fill',
+                        'white',
+                        '-pointsize',
+                        '60',
+                        '-gravity',
+                        'north',
+                        '-annotate',
+                        '+0+300',
+                        `Preparing Trip...\n${this.tripName}`,
+                        out,
+                    ],
+                }).output();
+            } catch (e) {
+                logger.error(`[Scanner] Failed to generate status image: ${getErrorMessage(e)}`);
+            }
+
+            this.refresh();
+            this.broadcastState();
+
             logger.info(
                 `[Scanner] Running exiftool on ${needsScan.length} new/changed file(s) of ${manifest.manifest?.photos.length ?? 0} total.`,
             );
@@ -2101,7 +2451,7 @@ program.description(`${PROGRAM} - Cast albums to Chromecast`)
     .option('--headless', 'Headless background mode', false)
     .option('-c, --clear-cache', 'Wipe Cache', false)
     .option('--view-root <string>', 'Persistent view-tree root for rendered images + manifests', DEFAULT_VIEW_ROOT)
-    .option('--website <string>', 'Website folder or HTML entry file', './website');
+    .option('--website <string>', 'Website folder or HTML entry file', DEFAULT_WEBSITE_DIR);
 
 program.parse(process.argv);
 const options = program.opts();
@@ -2149,6 +2499,7 @@ if (options.clearCache) {
         logger.warn('Could not clear cache.');
     }
 }
+
 if (options.website) {
     try {
         await Deno.stat(isAbsolute(options.website) ? options.website : join(Deno.cwd(), options.website));
@@ -2161,4 +2512,9 @@ if (options.website) {
 // const isRunningAsDaemon = !!Deno.env.get('PHOTOCAST_BACKGROUND');
 
 logger.info(`[Startup] View tree root: ${options.viewRoot}`);
-new PhotoCastSystem(options.yaml, parseInt(options.port), options.website, options.viewRoot).start(options.search);
+new PhotoCastSystem(
+    options.yaml,
+    parseInt(options.port),
+    options.website,
+    options.viewRoot,
+).start(options.search);
