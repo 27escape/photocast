@@ -441,6 +441,7 @@
       </div>
     </div>
 
+    <script src="caption-format.js"></script>
     <script>
       let socket,
         tripList = [],
@@ -655,33 +656,11 @@
             state.sess;
           const exif = state.exifs[state.index];
           if (exif) {
-            const isDark =
-              String(exif.pc_is_dark ?? "").toLowerCase() === "true";
+            const isDark = isDarkPhoto(exif);
             hud.style.color = isDark ? "white" : "#eee";
 
-            document.getElementById("hud-left").innerText = "";
-            let hud_line = "";
-            
-            if (exif["Date/Time Original"]) {
-              const dtParts = exif["Date/Time Original"].split(" ");
-              const datePart = dtParts[0] ? dtParts[0].replace(/:/g, "-") : "";
-              const timePart = dtParts[1] ? dtParts[1] : "";
-              hud_line = timePart ? `${datePart} ${timePart}` : datePart;
-            }
+            document.getElementById("hud-left").innerText = formatPhotoCaption(exif);
 
-            hud_line += exif.pc_location ? " | " + exif.pc_location : "";
-            hud_line += ` | F${exif.pc_aperture || "--"} | SS ${exif.pc_shutter || "--"} | ISO ${exif.pc_iso || "--"}`;
-            
-            const focalLength = exif["Focal Length In 35mm Format"] || exif["Focal Length 35mm Equiv"];
-            let zoom = "--";
-            if (focalLength) {
-                const val = parseFloat(focalLength);
-                if (!isNaN(val)) zoom = Math.round(val);
-            }
-            hud_line += ` | ZOOM (FF) ${zoom}`;
-            
-            document.getElementById("hud-left").innerText = hud_line;
-            
             img.onload = () => {
               try {
                 const wrapper = document.getElementById("img-wrapper");
