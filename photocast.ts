@@ -8,12 +8,13 @@ import castv2 from 'castv2-client';
 import { Command } from 'commander';
 import { parse as parseYaml } from 'https://deno.land/std@0.208.0/yaml/mod.ts';
 import { basename, dirname, extname, isAbsolute, join, parse as parsePath } from 'https://deno.land/std@0.208.0/path/mod.ts';
+import { isIP } from 'node:net';
 import process from 'node:process';
 import { logger, setLogFile, getLogFile, setLogLevel } from '../various_tools/lib/logger.ts';
 
 
 const PROGRAM = 'photocast';
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 const DEFAULT_PORT = 7080;
 
 // Resolves the default website directory relative to where photocast itself
@@ -163,6 +164,23 @@ type Settings = {
     port: number;
 };
 
+const ALLOWED_TIMEOUTS = new Set([5, 10, 15, 30, 45, 60, 120, 300]);
+const SUPPORTED_MOVE_STEPS = new Set([-50, -10, -1, 1, 10, 50]);
+const HOSTNAME_PATTERN = /^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*$/;
+
+function normalizeSettings(input: unknown, current: Settings): Settings | null {
+    if (!input || typeof input !== 'object') return null;
+    const candidate = input as Partial<Settings>;
+    const ip = typeof candidate.ip === 'string' ? candidate.ip.trim() : '';
+    const timeout = candidate.timeout;
+
+    if (!ip || (isIP(ip) === 0 && !HOSTNAME_PATTERN.test(ip))) return null;
+    if (typeof timeout !== 'number' || !Number.isInteger(timeout) || !ALLOWED_TIMEOUTS.has(timeout)) return null;
+
+    // The listening port is configured at startup and is not remotely mutable.
+    return { ip, timeout, port: current.port };
+}
+
 type ExifData = {
     [key: string]: string | undefined;
     pc_aperture?: string;
@@ -184,6 +202,9 @@ type PhotoEntry = {
 type TripItem = {
     name: string;
     start: string;
+    end: string;
+    exact?: boolean;
+    extended?: boolean;
 };
 
 type TripConfig = {
@@ -1494,7 +1515,7 @@ class BackgroundSweeper {
         try {
             ({ needsScan } = await manifest.reconcile(tripPath));
         } catch (e) {
-            logger.warn(`[Sweeper] ${name}: could not read source directory (${getErrorMessage(e)}); leaving as-is.`);
+            logger.warn(`[Sweeper] ${name}: could not read source directory ${tripPath} (${getErrorMessage(e)}); leaving as-is.`);
             return;
         }
 
@@ -1743,6 +1764,22 @@ class PhotoCastSystem {
         throw new Error(`No HTML entry file found in website directory: ${dir}`);
     }
 
+    private applySettings(input: unknown): Settings | null {
+        const settings = normalizeSettings(input, this.settings);
+        if (!settings) return null;
+
+        this.settings = settings;
+        try {
+            Deno.mkdirSync(USER_CACHE_DIR, { recursive: true });
+            Deno.writeTextFileSync(SETTINGS_FILE, JSON.stringify(this.settings));
+        } catch (e) {
+            logger.error(`[Settings] Write error: ${getErrorMessage(e)}`);
+        }
+        this.cast.updateIp(this.settings.ip);
+        this.timeRemaining = this.settings.timeout;
+        return settings;
+    }
+
     private async saveState() {
         const data: RestoredState = {
             tripName: this.tripName,
@@ -1833,13 +1870,22 @@ class PhotoCastSystem {
                 try {
                     const d = JSON.parse(e.data);
                     if (d.type === 'MOVE') {
+                        if (!SUPPORTED_MOVE_STEPS.has(d.step)) {
+                            logger.warn(`[Playback] Ignoring invalid move step: ${String(d.step)}`);
+                            return;
+                        }
                         this.lastInteractionTime = Date.now();
                         this.move(d.step);
                     }
                     if (d.type === 'JUMP') {
+                        if (!Number.isInteger(d.index) || d.index < 0 || d.index >= this.photoEntries.length) {
+                            logger.warn(`[Playback] Ignoring invalid jump index: ${String(d.index)}`);
+                            return;
+                        }
                         this.lastInteractionTime = Date.now();
                         this.currentIndex = d.index;
                         this.timeRemaining = this.settings.timeout;
+                        this.saveState();
                         this.refresh();
                         this.broadcastState();
                     }
@@ -1849,11 +1895,8 @@ class PhotoCastSystem {
                         this.broadcastState();
                     }
                     if (d.type === 'UPDATE_SETTINGS') {
-                        this.settings = { ...this.settings, ...d.settings };
-                        Deno.writeTextFileSync(SETTINGS_FILE, JSON.stringify(this.settings));
-                        this.cast.updateIp(this.settings.ip);
-                        this.timeRemaining = this.settings.timeout;
-                        this.broadcastState();
+                        if (this.applySettings(d.settings)) this.broadcastState(true);
+                        else logger.warn('Could not update settings: invalid values.');
                     }
                 } catch {
                     logger.warn('Could not update settings.');
@@ -1927,12 +1970,12 @@ class PhotoCastSystem {
                     }
                     if (hasFiles) validTrips.push(t);
                 } catch {
-                    logger.warn('Could not read trip directory.');
+                    logger.warn(`Could not read trip directory: ${tripPath}`);
                 }
             }
             ctx.response.body = validTrips.sort((a: TripItem, b: TripItem) =>
                 new Date(b.start).getTime() - new Date(a.start).getTime()
-            ).map((t: TripItem) => t.name);
+            ).map((t: TripItem) => ({ name: t.name, extended: t.extended === true }));
         });
 
         router.get('/search', async (ctx) => {
@@ -1976,25 +2019,16 @@ class PhotoCastSystem {
 
         router.post('/update-settings', async (ctx) => {
             try {
-                const body = await ctx.request.body({ type: 'json' }).value as Partial<Settings>;
-                this.settings = { ...this.settings, ...body };
-                try {
-                    try {
-                        Deno.mkdirSync(USER_CACHE_DIR, { recursive: true });
-                    } catch {
-                        logger.warn(
-                            'Could not create cache directory for settings. Changes will not be saved persistently.',
-                        );
-                    }
-                    Deno.writeTextFileSync(SETTINGS_FILE, JSON.stringify(this.settings));
-                } catch (e) {
-                    logger.error(`[Settings] Write error: ${getErrorMessage(e)}`);
+                const body = await ctx.request.body({ type: 'json' }).value;
+                const settings = this.applySettings(body);
+                if (!settings) {
+                    ctx.response.status = 400;
+                    ctx.response.body = { status: 'error', message: 'invalid settings' };
+                    return;
                 }
-                this.cast.updateIp(this.settings.ip);
-                this.timeRemaining = this.settings.timeout;
                 this.broadcastState(true);
                 ctx.response.status = 200;
-                ctx.response.body = { status: 'ok', settings: this.settings };
+                ctx.response.body = { status: 'ok', settings };
             } catch (e) {
                 logger.error(`[Settings] Update failed: ${getErrorMessage(e)}`);
                 ctx.response.status = 400;
@@ -2100,7 +2134,7 @@ class PhotoCastSystem {
                     // No separate status message on DefaultMediaReceiver -
                     // just point the media player at the /img/.../status
                     // placeholder image.
-                    const url = `http://${LOCAL_IP}:${this.port}/img/${tripSafe}/status?t=${Date.now()}`;
+                    const url = `http://${LOCAL_IP}:${this.port}/img/${encodeURIComponent(tripSafe)}/status?t=${Date.now()}`;
                     this.cast.showPhoto(url, {});
                     this.lastCastTime = Date.now();
                     return;
@@ -2132,7 +2166,7 @@ class PhotoCastSystem {
     // image is ever "current" at a time; a fresh one simply overwrites it.
     private async composeCaptionedPhoto(entry: PhotoEntry) {
         const tripSafe = this.tripName.replace(/[^a-z0-9]/gi, '_');
-        const plainUrl = `http://${LOCAL_IP}:${this.port}/img/${tripSafe}/${basename(entry.path)}?t=${Date.now()}`;
+        const plainUrl = `http://${LOCAL_IP}:${this.port}/img/${encodeURIComponent(tripSafe)}/${encodeURIComponent(basename(entry.path))}?t=${Date.now()}`;
 
         if (!this.currentManifest) {
             this.cast.showPhoto(plainUrl, {});
